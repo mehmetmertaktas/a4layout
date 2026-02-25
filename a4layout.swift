@@ -1207,10 +1207,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var opacitySlider: NSSlider!
     var opacityLabel: NSTextField!
     var gridBtn: NSButton!
-
-    // Line state stored for drawing
-    var lastLineColor: NSColor = .black
-    var lastLineWidth: CGFloat = 1
+    var textModeBtn: NSButton!
+    var lineModeBtn: NSButton!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         doc = DocumentView(frame: .zero)
@@ -1245,7 +1243,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         // Constraints
         NSLayoutConstraint.activate([
-            toolbar.heightAnchor.constraint(equalToConstant: 36),
+            toolbar.heightAnchor.constraint(equalToConstant: 40),
             toolbar.leadingAnchor.constraint(equalTo: stack.leadingAnchor),
             toolbar.trailingAnchor.constraint(equalTo: stack.trailingAnchor),
             sep.leadingAnchor.constraint(equalTo: stack.leadingAnchor),
@@ -1272,138 +1270,166 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     // ── Toolbar ──
 
     func buildToolbar() -> NSView {
-        let bar = NSView(frame: NSRect(x: 0, y: 0, width: 700, height: 36))
+        let bar = NSView(frame: NSRect(x: 0, y: 0, width: 700, height: 40))
         bar.wantsLayer = true
-        bar.layer?.backgroundColor = NSColor(white: 0.96, alpha: 1).cgColor
+        bar.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+
+        let scroll = NSScrollView(frame: .zero)
+        scroll.hasHorizontalScroller = false
+        scroll.hasVerticalScroller = false
+        scroll.drawsBackground = false
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        bar.addSubview(scroll)
+        NSLayoutConstraint.activate([
+            scroll.leadingAnchor.constraint(equalTo: bar.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: bar.trailingAnchor),
+            scroll.topAnchor.constraint(equalTo: bar.topAnchor),
+            scroll.bottomAnchor.constraint(equalTo: bar.bottomAnchor),
+        ])
 
         let stack = NSStackView()
         stack.orientation = .horizontal
-        stack.spacing = 6
-        stack.edgeInsets = NSEdgeInsets(top: 2, left: 8, bottom: 2, right: 8)
+        stack.spacing = 4
+        stack.edgeInsets = NSEdgeInsets(top: 4, left: 10, bottom: 4, right: 10)
         stack.alignment = .centerY
+        scroll.documentView = stack
         stack.translatesAutoresizingMaskIntoConstraints = false
-        bar.addSubview(stack)
         NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: bar.leadingAnchor),
-            stack.trailingAnchor.constraint(equalTo: bar.trailingAnchor),
-            stack.topAnchor.constraint(equalTo: bar.topAnchor),
-            stack.bottomAnchor.constraint(equalTo: bar.bottomAnchor),
+            stack.topAnchor.constraint(equalTo: scroll.topAnchor),
+            stack.bottomAnchor.constraint(equalTo: scroll.bottomAnchor),
+            stack.leadingAnchor.constraint(equalTo: scroll.leadingAnchor),
+            stack.heightAnchor.constraint(equalTo: scroll.heightAnchor),
         ])
 
-        // Page size
-        pageSizePopup = NSPopUpButton(frame: .zero, pullsDown: false)
-        pageSizePopup.controlSize = .small
-        pageSizePopup.font = NSFont.systemFont(ofSize: 11)
-        for ps in PageSize.allCases { pageSizePopup.addItem(withTitle: ps.rawValue) }
-        pageSizePopup.target = self; pageSizePopup.action = #selector(pageSizeChanged(_:))
+        // ── Page setup group ──
+        pageSizePopup = makePopup(["A4", "US Letter"], action: #selector(pageSizeChanged(_:)))
+        stack.addArrangedSubview(makeLabel("Page:"))
         stack.addArrangedSubview(pageSizePopup)
 
-        // BG color
-        bgPopup = NSPopUpButton(frame: .zero, pullsDown: false)
-        bgPopup.controlSize = .small
-        bgPopup.font = NSFont.systemFont(ofSize: 11)
-        for title in ["White", "Light Gray", "Cream", "Black"] {
-            bgPopup.addItem(withTitle: title)
-        }
-        bgPopup.target = self; bgPopup.action = #selector(bgColorChanged(_:))
+        bgPopup = makePopup(["White BG", "Gray BG", "Cream BG", "Black BG"],
+                             action: #selector(bgColorChanged(_:)))
         stack.addArrangedSubview(bgPopup)
 
-        stack.addArrangedSubview(makeSep())
+        stack.addArrangedSubview(makeDivider())
 
-        // Paste
-        let pasteBtn = makeBtn("Paste", action: #selector(pasteImage))
+        // ── Insert group ──
+        let pasteBtn = makeIconBtn("doc.on.clipboard", label: "Paste",
+                                    action: #selector(pasteImage))
         stack.addArrangedSubview(pasteBtn)
 
-        // Text
-        let textBtn = makeBtn("Text", action: #selector(enterTextMode))
-        stack.addArrangedSubview(textBtn)
+        textModeBtn = makeIconBtn("textformat", label: "Text",
+                                   action: #selector(enterTextMode))
+        stack.addArrangedSubview(textModeBtn)
 
-        // Line
-        let lineBtn = makeBtn("Line", action: #selector(enterLineMode))
-        stack.addArrangedSubview(lineBtn)
+        lineModeBtn = makeIconBtn("line.diagonal", label: "Line",
+                                   action: #selector(enterLineMode))
+        stack.addArrangedSubview(lineModeBtn)
 
-        stack.addArrangedSubview(makeSep())
+        stack.addArrangedSubview(makeDivider())
 
-        // Frame color
-        framePopup = NSPopUpButton(frame: .zero, pullsDown: false)
-        framePopup.controlSize = .small
-        framePopup.font = NSFont.systemFont(ofSize: 11)
-        for title in ["No Frame", "Black", "Dark Gray", "Red", "Blue"] {
-            framePopup.addItem(withTitle: title)
-        }
-        framePopup.target = self; framePopup.action = #selector(frameChanged(_:))
+        // ── Image properties group ──
+        stack.addArrangedSubview(makeLabel("Frame:"))
+        framePopup = makePopup(["None", "Black", "Gray", "Red", "Blue"],
+                                action: #selector(frameChanged(_:)))
         stack.addArrangedSubview(framePopup)
 
-        // Frame width
-        frameWidthPopup = NSPopUpButton(frame: .zero, pullsDown: false)
-        frameWidthPopup.controlSize = .small
-        frameWidthPopup.font = NSFont.systemFont(ofSize: 11)
-        for title in ["Thin", "Medium", "Thick"] {
-            frameWidthPopup.addItem(withTitle: title)
-        }
-        frameWidthPopup.selectItem(at: 1) // Medium default
-        frameWidthPopup.target = self; frameWidthPopup.action = #selector(frameWidthChanged(_:))
+        frameWidthPopup = makePopup(["0.5pt", "1pt", "2pt"],
+                                     action: #selector(frameWidthChanged(_:)))
+        frameWidthPopup.selectItem(at: 1)
         stack.addArrangedSubview(frameWidthPopup)
 
-        // Rotate
-        let rotateBtn = makeBtn("Rotate", action: #selector(rotateImage))
+        let rotateBtn = makeIconBtn("rotate.right", label: "Rotate",
+                                     action: #selector(rotateImage))
         stack.addArrangedSubview(rotateBtn)
 
-        // Opacity
-        let opLabel = NSTextField(labelWithString: "Opacity:")
-        opLabel.controlSize = .small; opLabel.font = NSFont.systemFont(ofSize: 10)
-        stack.addArrangedSubview(opLabel)
+        stack.addArrangedSubview(makeDivider())
+
+        // ── Opacity ──
+        stack.addArrangedSubview(makeLabel("Opacity:"))
         opacitySlider = NSSlider(value: 1.0, minValue: 0.05, maxValue: 1.0,
                                   target: self, action: #selector(opacityChanged(_:)))
         opacitySlider.controlSize = .small
-        opacitySlider.widthAnchor.constraint(equalToConstant: 60).isActive = true
+        opacitySlider.widthAnchor.constraint(equalToConstant: 64).isActive = true
         stack.addArrangedSubview(opacitySlider)
         opacityLabel = NSTextField(labelWithString: "100%")
-        opacityLabel.controlSize = .small; opacityLabel.font = NSFont.systemFont(ofSize: 10)
-        opacityLabel.widthAnchor.constraint(equalToConstant: 30).isActive = true
+        opacityLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .regular)
+        opacityLabel.textColor = .secondaryLabelColor
+        opacityLabel.widthAnchor.constraint(equalToConstant: 32).isActive = true
         stack.addArrangedSubview(opacityLabel)
 
-        stack.addArrangedSubview(makeSep())
+        stack.addArrangedSubview(makeDivider())
 
-        // Grid
-        gridBtn = makeBtn("Grid", action: #selector(toggleGrid))
+        // ── View group ──
+        gridBtn = makeIconBtn("grid", label: "Grid", action: #selector(toggleGrid))
+        gridBtn.setButtonType(.toggle)
         stack.addArrangedSubview(gridBtn)
 
-        stack.addArrangedSubview(makeSep())
+        stack.addArrangedSubview(makeDivider())
 
-        // +/- Page
-        let addPgBtn = makeBtn("+ Page", action: #selector(addPage))
-        let rmPgBtn = makeBtn("− Page", action: #selector(removePage))
+        // ── Pages ──
+        let addPgBtn = makeIconBtn("plus.rectangle", label: "Page",
+                                    action: #selector(addPage))
+        let rmPgBtn = makeIconBtn("minus.rectangle", label: "Page",
+                                   action: #selector(removePage))
         stack.addArrangedSubview(addPgBtn)
         stack.addArrangedSubview(rmPgBtn)
 
-        stack.addArrangedSubview(makeSep())
+        stack.addArrangedSubview(makeDivider())
 
-        // Save PDF
-        let saveBtn = makeBtn("Save PDF", action: #selector(savePDF))
+        // ── Save ──
+        let saveBtn = makeIconBtn("square.and.arrow.down", label: "PDF",
+                                   action: #selector(savePDF))
         stack.addArrangedSubview(saveBtn)
-
-        // Spacer to push everything left
-        let spacer = NSView()
-        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        stack.addArrangedSubview(spacer)
 
         return bar
     }
 
-    func makeBtn(_ title: String, action: Selector) -> NSButton {
-        let btn = NSButton(title: title, target: self, action: action)
+    func makeIconBtn(_ symbolName: String, label: String, action: Selector) -> NSButton {
+        let btn: NSButton
+        if let img = NSImage(systemSymbolName: symbolName,
+                              accessibilityDescription: label) {
+            let config = NSImage.SymbolConfiguration(pointSize: 12, weight: .medium)
+            let styled = img.withSymbolConfiguration(config) ?? img
+            btn = NSButton(title: " \(label)", image: styled, target: self, action: action)
+            btn.imagePosition = .imageLeading
+        } else {
+            btn = NSButton(title: label, target: self, action: action)
+        }
         btn.controlSize = .small
-        btn.bezelStyle = .smallSquare
+        btn.bezelStyle = .rounded
         btn.font = NSFont.systemFont(ofSize: 11)
+        btn.setContentHuggingPriority(.defaultHigh, for: .horizontal)
         return btn
     }
 
-    func makeSep() -> NSView {
-        let sep = NSBox(frame: NSRect(x: 0, y: 0, width: 1, height: 20))
-        sep.boxType = .separator
-        sep.widthAnchor.constraint(equalToConstant: 1).isActive = true
-        return sep
+    func makePopup(_ items: [String], action: Selector) -> NSPopUpButton {
+        let popup = NSPopUpButton(frame: .zero, pullsDown: false)
+        popup.controlSize = .small
+        popup.font = NSFont.systemFont(ofSize: 11)
+        for title in items { popup.addItem(withTitle: title) }
+        popup.target = self; popup.action = action
+        popup.setContentHuggingPriority(.defaultHigh, for: .horizontal)
+        return popup
+    }
+
+    func makeLabel(_ text: String) -> NSTextField {
+        let label = NSTextField(labelWithString: text)
+        label.font = NSFont.systemFont(ofSize: 10, weight: .medium)
+        label.textColor = .secondaryLabelColor
+        label.setContentHuggingPriority(.defaultHigh, for: .horizontal)
+        return label
+    }
+
+    func makeDivider() -> NSView {
+        let div = NSView(frame: NSRect(x: 0, y: 0, width: 1, height: 24))
+        div.wantsLayer = true
+        div.layer?.backgroundColor = NSColor.separatorColor.cgColor
+        div.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            div.widthAnchor.constraint(equalToConstant: 1),
+            div.heightAnchor.constraint(equalToConstant: 24),
+        ])
+        return div
     }
 
     func updateToolbarForSelection() {
@@ -1411,10 +1437,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         framePopup.isEnabled = hasImg
         frameWidthPopup.isEnabled = hasImg
         opacitySlider.isEnabled = hasImg
+
+        // Highlight active mode
+        textModeBtn.state = doc.mode == .addText ? .on : .off
+        lineModeBtn.state = doc.mode == .drawLine ? .on : .off
+
         if let item = doc.selectedImage {
             opacitySlider.doubleValue = Double(item.opacity)
             opacityLabel.stringValue = "\(Int(item.opacity * 100))%"
-            // Update frame popup
             if let fc = item.frameColor {
                 if fc == .black { framePopup.selectItem(at: 1) }
                 else if fc == NSColor.darkGray { framePopup.selectItem(at: 2) }
@@ -1424,7 +1454,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             } else {
                 framePopup.selectItem(at: 0)
             }
-            // Frame width
             if item.frameWidth <= 0.5 { frameWidthPopup.selectItem(at: 0) }
             else if item.frameWidth <= 1 { frameWidthPopup.selectItem(at: 1) }
             else { frameWidthPopup.selectItem(at: 2) }
@@ -1468,14 +1497,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     @objc func toggleGrid() {
         doc.toggleGrid()
         gridBtn.state = doc.showGrid ? .on : .off
+        updateToolbarForSelection()
     }
 
     @objc func enterTextMode() {
-        doc.mode = .addText
+        doc.mode = doc.mode == .addText ? .select : .addText
+        updateToolbarForSelection()
     }
 
     @objc func enterLineMode() {
-        doc.mode = .drawLine
+        doc.mode = doc.mode == .drawLine ? .select : .drawLine
+        updateToolbarForSelection()
     }
 
     // ── Layout ──
@@ -1561,27 +1593,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     @objc func removePage() { doc.removePage(); relayout() }
 
     // ── Window delegate (unsaved changes) ──
-
-    func windowShouldClose(_ sender: NSWindow) -> Bool {
-        guard doc.isDirty else { return true }
-        let alert = NSAlert()
-        alert.messageText = "You have unsaved changes."
-        alert.informativeText = "Do you want to save as PDF before closing?"
-        alert.addButton(withTitle: "Save")
-        alert.addButton(withTitle: "Don\u{2019}t Save")
-        alert.addButton(withTitle: "Cancel")
-        alert.alertStyle = .warning
-        let response = alert.runModal()
-        switch response {
-        case .alertFirstButtonReturn:
-            doc.exportPDF()
-            return !doc.isDirty  // only close if they actually saved
-        case .alertSecondButtonReturn:
-            return true
-        default:
-            return false
-        }
-    }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard doc.isDirty else { return .terminateNow }
