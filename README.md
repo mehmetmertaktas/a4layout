@@ -18,7 +18,7 @@ A minimal native macOS app for arranging images on A4 pages and exporting as PDF
 Requires macOS 13+ and Xcode Command Line Tools (`xcode-select --install`).
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/a4layout.git
+git clone https://github.com/mehmetmertaktas/a4layout.git
 cd a4layout
 ./build.sh
 ```
