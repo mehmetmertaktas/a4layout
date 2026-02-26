@@ -27,7 +27,7 @@ class ImageItem {
     var frameColor: NSColor? = nil   // nil = no frame
     var frameWidth: CGFloat = 1
     var opacity: CGFloat = 1.0
-    var rotation: Int = 0            // 0, 90, 180, 270
+    var rotation: CGFloat = 0        // degrees, any angle
 
     init(image: NSImage, x: CGFloat, y: CGFloat, width: CGFloat) {
         self.image = image
@@ -39,29 +39,18 @@ class ImageItem {
 
     func clone(offsetX: CGFloat = 15, offsetY: CGFloat = 15) -> ImageItem {
         let c = ImageItem(image: image, x: x + offsetX, y: y + offsetY, width: width)
+        c.height = height; c.aspectRatio = aspectRatio
         c.frameColor = frameColor; c.frameWidth = frameWidth
         c.opacity = opacity; c.rotation = rotation
         return c
     }
 
-    func rotated90CW() {
-        let newImg = NSImage(size: NSSize(width: image.size.height, height: image.size.width))
-        newImg.lockFocus()
-        let t = NSAffineTransform()
-        t.translateX(by: newImg.size.width / 2, yBy: newImg.size.height / 2)
-        t.rotate(byDegrees: -90)
-        t.translateX(by: -image.size.width / 2, yBy: -image.size.height / 2)
-        t.concat()
-        image.draw(in: NSRect(origin: .zero, size: image.size))
-        newImg.unlockFocus()
-        image = newImg
-        rotation = (rotation + 90) % 360
-        let cx = x + width / 2, cy = y + height / 2
-        aspectRatio = image.size.width / image.size.height
-        let newW = height   // swap w/h
-        let newH = newW / aspectRatio
-        width = newW; height = newH
-        x = cx - width / 2; y = cy - height / 2
+    /// Rotate by `degrees` around bounding-box center (no pixel manipulation).
+    func rotate(by degrees: CGFloat) {
+        rotation = rotation + degrees
+        // Normalize to 0..<360
+        rotation = rotation.truncatingRemainder(dividingBy: 360)
+        if rotation < 0 { rotation += 360 }
     }
 }
 
@@ -84,8 +73,12 @@ class TextItem {
         return c
     }
 
+    var font: NSFont {
+        NSFont(name: "Helvetica", size: fontSize) ?? NSFont.systemFont(ofSize: fontSize)
+    }
+
     var attrs: [NSAttributedString.Key: Any] {
-        [.font: NSFont.systemFont(ofSize: fontSize), .foregroundColor: color]
+        [.font: font, .foregroundColor: color]
     }
 
     var size: NSSize { (text as NSString).size(withAttributes: attrs) }
@@ -137,7 +130,7 @@ enum InteractionMode {
 struct UndoSnapshot {
     struct ImgSnap {
         let image: NSImage; let x, y, width, height, aspectRatio, opacity, frameWidth: CGFloat
-        let frameColor: NSColor?; let rotation: Int
+        let frameColor: NSColor?; let rotation: CGFloat
     }
     struct TxtSnap {
         let text: String; let x, y, fontSize: CGFloat; let color: NSColor
@@ -229,6 +222,8 @@ class DocumentView: NSView, NSTextFieldDelegate {
     private var itemStartCenter = NSPoint.zero
     private var lineStartEnd = NSPoint.zero   // second endpoint for line drag
     private var newLineItem: LineItem?
+    private var isResizingText = false
+    private var itemStartFontSize: CGFloat = 0
 
     // Text editing
     private var editingTextField: NSTextField?
@@ -256,9 +251,20 @@ class DocumentView: NSView, NSTextFieldDelegate {
     override init(frame: NSRect) {
         super.init(frame: frame)
         registerForDraggedTypes([.fileURL, .tiff, .png])
+
+        let pinch = NSMagnificationGestureRecognizer(target: self, action: #selector(handlePinch(_:)))
+        addGestureRecognizer(pinch)
+        let rotate = NSRotationGestureRecognizer(target: self, action: #selector(handleRotate(_:)))
+        addGestureRecognizer(rotate)
     }
 
     required init?(coder: NSCoder) { fatalError() }
+
+    // ── Trackpad gesture state ──
+    private var gestureStartWidth: CGFloat = 0
+    private var gestureStartHeight: CGFloat = 0
+    private var gestureStartFontSize: CGFloat = 0
+    private var gestureStartRotation: CGFloat = 0
 
     func totalHeight(forWidth w: CGFloat) -> CGFloat {
         let pw = max(100, w - pad * 2)
@@ -481,10 +487,10 @@ class DocumentView: NSView, NSTextFieldDelegate {
             // Grid overlay (before items)
             if showGrid {
                 let gridSpacing: CGFloat = 50  // A4 points
-                NSColor(white: 0.75, alpha: 0.35).setStroke()
+                NSColor(white: 0.60, alpha: 0.50).setStroke()
                 let gp = NSBezierPath()
-                gp.lineWidth = 0.25
-                let pattern: [CGFloat] = [4, 4]
+                gp.lineWidth = 0.5
+                let pattern: [CGFloat] = [6, 3]
                 gp.setLineDash(pattern, count: 2, phase: 0)
                 var gx: CGFloat = gridSpacing
                 while gx < PW {
@@ -549,7 +555,22 @@ class DocumentView: NSView, NSTextFieldDelegate {
             for item in images {
                 guard item.y + item.height > pageTop && item.y < pageBot else { continue }
                 let f = screenFrame(for: item)
-                item.image.draw(in: f, from: .zero, operation: .sourceOver, fraction: item.opacity)
+
+                // Apply rotation transform around center
+                let cx = f.midX, cy = f.midY
+                let hasRotation = abs(item.rotation) > 0.01
+                if hasRotation {
+                    NSGraphicsContext.saveGraphicsState()
+                    let rot = NSAffineTransform()
+                    rot.translateX(by: cx, yBy: cy)
+                    rot.rotate(byDegrees: -item.rotation)  // negative for CW in flipped
+                    rot.translateX(by: -cx, yBy: -cy)
+                    rot.concat()
+                }
+
+                item.image.draw(in: f, from: NSRect(origin: .zero, size: item.image.size),
+                                operation: .sourceOver, fraction: item.opacity,
+                                respectFlipped: true, hints: nil)
 
                 if let fc = item.frameColor {
                     fc.setStroke()
@@ -558,10 +579,17 @@ class DocumentView: NSView, NSTextFieldDelegate {
                     bezel.stroke()
                 }
 
+                if hasRotation {
+                    NSGraphicsContext.restoreGraphicsState()
+                }
+
                 if item.isSelected {
+                    // Draw selection border without rotation (in screen space)
                     NSColor.controlAccentColor.withAlphaComponent(0.5).setStroke()
                     let border = NSBezierPath(rect: f.insetBy(dx: -1, dy: -1))
                     border.lineWidth = 1.5
+                    let dashPattern: [CGFloat] = [4, 4]
+                    border.setLineDash(dashPattern, count: 2, phase: 0)
                     border.stroke()
                     // Resize handle
                     let c = NSPoint(x: f.maxX, y: f.maxY)
@@ -582,8 +610,10 @@ class DocumentView: NSView, NSTextFieldDelegate {
                 let drawRect = NSRect(x: o.x, y: o.y, width: sz.width * scale, height: sz.height * scale)
 
                 // Scale the font for screen rendering
+                let scaledFont = NSFont(name: "Helvetica", size: item.fontSize * scale)
+                    ?? NSFont.systemFont(ofSize: item.fontSize * scale)
                 let scaledAttrs: [NSAttributedString.Key: Any] = [
-                    .font: NSFont.systemFont(ofSize: item.fontSize * scale),
+                    .font: scaledFont,
                     .foregroundColor: item.color
                 ]
                 (item.text as NSString).draw(at: NSPoint(x: o.x, y: o.y), withAttributes: scaledAttrs)
@@ -595,6 +625,14 @@ class DocumentView: NSView, NSTextFieldDelegate {
                     let dashPattern: [CGFloat] = [3, 3]
                     border.setLineDash(dashPattern, count: 2, phase: 0)
                     border.stroke()
+                    // Resize handle (bottom-right)
+                    let th = NSPoint(x: drawRect.maxX, y: drawRect.maxY)
+                    let tov = NSRect(x: th.x - handleR, y: th.y - handleR,
+                                     width: handleR * 2, height: handleR * 2)
+                    NSColor.controlAccentColor.setFill()
+                    NSBezierPath(ovalIn: tov).fill()
+                    NSColor.white.setFill()
+                    NSBezierPath(ovalIn: tov.insetBy(dx: 1.5, dy: 1.5)).fill()
                 }
             }
 
@@ -689,6 +727,11 @@ class DocumentView: NSView, NSTextFieldDelegate {
         return hypot(sp.x - f.maxX, sp.y - f.maxY) < handleR + 6
     }
 
+    private func isOnTextHandle(screen sp: NSPoint, item: TextItem) -> Bool {
+        let f = screenFrame(for: item)
+        return hypot(sp.x - f.maxX, sp.y - f.maxY) < handleR + 6
+    }
+
     // ── Mouse events ──
 
     override func mouseDown(with event: NSEvent) {
@@ -742,6 +785,14 @@ class DocumentView: NSView, NSTextFieldDelegate {
             isDragging = true
             dragStartScreen = sp
             itemStartPos = NSPoint(x: hit.x, y: hit.y)
+        } else if let item = selectedText, isOnTextHandle(screen: sp, item: item) {
+            // Text resize handle
+            pushUndo()
+            isResizingText = true
+            dragStartScreen = sp
+            itemStartFontSize = item.fontSize
+            let sz = item.size
+            itemStartWidth = sz.width
         } else if let hit = hitText(at: a4) {
             if hit === selectedText && event.clickCount == 2 {
                 beginTextEditing(hit)
@@ -753,12 +804,32 @@ class DocumentView: NSView, NSTextFieldDelegate {
                 itemStartPos = NSPoint(x: hit.x, y: hit.y)
             }
         } else if let hit = hitLine(at: a4) {
-            pushUndo()
-            selectLine(hit)
-            isDragging = true
-            dragStartScreen = sp
-            itemStartPos = NSPoint(x: hit.x1, y: hit.y1)
-            lineStartEnd = NSPoint(x: hit.x2, y: hit.y2)
+            if hit === selectedLine && event.clickCount == 2 {
+                // Double-click: extend line to page edges
+                pushUndo()
+                let ldx = abs(hit.x2 - hit.x1), ldy = abs(hit.y2 - hit.y1)
+                let page = min(max(0, Int(min(hit.y1, hit.y2) / PH)), numPages - 1)
+                let pageTop = CGFloat(page) * PH
+                if ldx >= ldy {
+                    // More horizontal → extend to full page width
+                    hit.x1 = 0; hit.x2 = PW
+                    let avgY = (hit.y1 + hit.y2) / 2
+                    hit.y1 = avgY; hit.y2 = avgY
+                } else {
+                    // More vertical → extend to full page height
+                    hit.y1 = pageTop; hit.y2 = pageTop + PH
+                    let avgX = (hit.x1 + hit.x2) / 2
+                    hit.x1 = avgX; hit.x2 = avgX
+                }
+                markDirty(); needsDisplay = true
+            } else {
+                pushUndo()
+                selectLine(hit)
+                isDragging = true
+                dragStartScreen = sp
+                itemStartPos = NSPoint(x: hit.x1, y: hit.y1)
+                lineStartEnd = NSPoint(x: hit.x2, y: hit.y2)
+            }
         } else {
             deselectAll()
         }
@@ -771,17 +842,48 @@ class DocumentView: NSView, NSTextFieldDelegate {
 
         if isDrawingLine, let nl = newLineItem {
             var a4 = toA4(sp)
-            // Shift constrains to H/V
-            if event.modifierFlags.contains(.shift) {
+            let rawDx = a4.x - nl.x1, rawDy = a4.y - nl.y1
+            let angle = abs(atan2(rawDy, rawDx)) * 180 / .pi
+            let nearH = angle < 5 || angle > 175
+            let nearV = abs(angle - 90) < 5
+            // Shift forces H/V; also auto-snap if angle within 5°
+            if event.modifierFlags.contains(.shift) || nearH || nearV {
                 let adx = abs(a4.x - nl.x1), ady = abs(a4.y - nl.y1)
                 if adx > ady { a4.y = nl.y1 } else { a4.x = nl.x1 }
             }
             nl.x2 = a4.x; nl.y2 = a4.y
+            // Snap line endpoints to page edges/center and other items
+            let page = min(max(0, Int(nl.y1 / PH)), numPages - 1)
+            var txEdges: [CGFloat] = [0, PW / 2, PW]
+            let pageTop = CGFloat(page) * PH
+            var tyEdges: [CGFloat] = [0, PH / 2, PH]
+            for img in images {
+                let op = min(max(0, Int(img.y / PH)), numPages - 1)
+                guard op == page else { continue }
+                let oly = img.y - CGFloat(op) * PH
+                txEdges.append(contentsOf: [img.x, img.x + img.width / 2, img.x + img.width])
+                tyEdges.append(contentsOf: [oly, oly + img.height / 2, oly + img.height])
+            }
+            let sx2 = snapAxis(dragEdges: [nl.x2], targetEdges: txEdges, threshold: snapThreshold)
+            let localY2 = nl.y2 - pageTop
+            let sy2 = snapAxis(dragEdges: [localY2], targetEdges: tyEdges, threshold: snapThreshold)
+            if sx2.snapped { nl.x2 += sx2.delta }
+            if sy2.snapped { nl.y2 += sy2.delta }
+            var guides: [SnapGuide] = []
+            for pos in sx2.positions { guides.append(SnapGuide(axis: .vertical, a4Pos: pos, page: page)) }
+            for pos in sy2.positions { guides.append(SnapGuide(axis: .horizontal, a4Pos: pos, page: page)) }
+            activeGuides = guides
             needsDisplay = true
             return
         }
 
-        if isResizing, let item = selectedImage {
+        if isResizingText, let item = selectedText {
+            let newW = max(10, itemStartWidth + dx)
+            let ratio = newW / itemStartWidth
+            item.fontSize = min(200, max(6, itemStartFontSize * ratio))
+            markDirty()
+            needsDisplay = true
+        } else if isResizing, let item = selectedImage {
             let newW = max(20, itemStartWidth + dx)
             let newH = newW / item.aspectRatio
             item.width = newW; item.height = newH
@@ -807,6 +909,28 @@ class DocumentView: NSView, NSTextFieldDelegate {
                 item.y1 = itemStartPos.y + dy
                 item.x2 = lineStartEnd.x + dx
                 item.y2 = lineStartEnd.y + dy
+                // Snap line midpoint to page edges/center
+                let midX = (item.x1 + item.x2) / 2
+                let page = min(max(0, Int(min(item.y1, item.y2) / PH)), numPages - 1)
+                let pageTop = CGFloat(page) * PH
+                let midLocalY = ((item.y1 + item.y2) / 2) - pageTop
+                var txEdges: [CGFloat] = [0, PW / 2, PW]
+                var tyEdges: [CGFloat] = [0, PH / 2, PH]
+                for img in images {
+                    let op = min(max(0, Int(img.y / PH)), numPages - 1)
+                    guard op == page else { continue }
+                    let oly = img.y - CGFloat(op) * PH
+                    txEdges.append(contentsOf: [img.x, img.x + img.width / 2, img.x + img.width])
+                    tyEdges.append(contentsOf: [oly, oly + img.height / 2, oly + img.height])
+                }
+                let sx = snapAxis(dragEdges: [midX], targetEdges: txEdges, threshold: snapThreshold)
+                let sy = snapAxis(dragEdges: [midLocalY], targetEdges: tyEdges, threshold: snapThreshold)
+                if sx.snapped { item.x1 += sx.delta; item.x2 += sx.delta }
+                if sy.snapped { item.y1 += sy.delta; item.y2 += sy.delta }
+                var guides: [SnapGuide] = []
+                for pos in sx.positions { guides.append(SnapGuide(axis: .vertical, a4Pos: pos, page: page)) }
+                for pos in sy.positions { guides.append(SnapGuide(axis: .horizontal, a4Pos: pos, page: page)) }
+                activeGuides = guides
                 markDirty()
             }
             needsDisplay = true
@@ -830,8 +954,53 @@ class DocumentView: NSView, NSTextFieldDelegate {
         }
         isDragging = false
         isResizing = false
+        isResizingText = false
         activeGuides = []
         needsDisplay = true
+    }
+
+    // ── Trackpad gestures ──
+
+    @objc func handlePinch(_ gesture: NSMagnificationGestureRecognizer) {
+        if gesture.state == .began {
+            if let item = selectedImage {
+                pushUndo()
+                gestureStartWidth = item.width
+                gestureStartHeight = item.height
+            } else if let item = selectedText {
+                pushUndo()
+                gestureStartFontSize = item.fontSize
+            }
+        } else if gesture.state == .changed {
+            let s = 1 + gesture.magnification
+            if let item = selectedImage {
+                let cx = item.x + item.width / 2
+                let cy = item.y + item.height / 2
+                item.width = max(20, gestureStartWidth * s)
+                item.height = item.width / item.aspectRatio
+                item.x = cx - item.width / 2
+                item.y = cy - item.height / 2
+                markDirty(); needsDisplay = true
+            } else if let item = selectedText {
+                item.fontSize = min(200, max(6, gestureStartFontSize * s))
+                markDirty(); needsDisplay = true
+            }
+        }
+    }
+
+    @objc func handleRotate(_ gesture: NSRotationGestureRecognizer) {
+        guard let item = selectedImage else { return }
+        if gesture.state == .began {
+            pushUndo()
+            gestureStartRotation = item.rotation
+        } else if gesture.state == .changed {
+            let degrees = gesture.rotation * 180 / .pi
+            item.rotation = gestureStartRotation - CGFloat(degrees)
+            // Normalize
+            item.rotation = item.rotation.truncatingRemainder(dividingBy: 360)
+            if item.rotation < 0 { item.rotation += 360 }
+            markDirty(); needsDisplay = true
+        }
     }
 
     // ── Keyboard ──
@@ -880,7 +1049,8 @@ class DocumentView: NSView, NSTextFieldDelegate {
                                               width: max(100, sz.width * scale + 20),
                                               height: max(24, sz.height * scale + 4)))
         field.stringValue = item.text
-        field.font = NSFont.systemFont(ofSize: item.fontSize * scale)
+        field.font = NSFont(name: "Helvetica", size: item.fontSize * scale)
+            ?? NSFont.systemFont(ofSize: item.fontSize * scale)
         field.textColor = item.color
         field.isBordered = true
         field.isEditable = true
@@ -1048,10 +1218,30 @@ class DocumentView: NSView, NSTextFieldDelegate {
         }
     }
 
-    func rotateSelected() {
+    func bringToFront() {
+        if let item = selectedImage, let idx = images.firstIndex(where: { $0 === item }) {
+            pushUndo(); images.remove(at: idx); images.append(item); markDirty(); needsDisplay = true
+        } else if let item = selectedText, let idx = texts.firstIndex(where: { $0 === item }) {
+            pushUndo(); texts.remove(at: idx); texts.append(item); markDirty(); needsDisplay = true
+        } else if let item = selectedLine, let idx = lines.firstIndex(where: { $0 === item }) {
+            pushUndo(); lines.remove(at: idx); lines.append(item); markDirty(); needsDisplay = true
+        }
+    }
+
+    func sendToBack() {
+        if let item = selectedImage, let idx = images.firstIndex(where: { $0 === item }) {
+            pushUndo(); images.remove(at: idx); images.insert(item, at: 0); markDirty(); needsDisplay = true
+        } else if let item = selectedText, let idx = texts.firstIndex(where: { $0 === item }) {
+            pushUndo(); texts.remove(at: idx); texts.insert(item, at: 0); markDirty(); needsDisplay = true
+        } else if let item = selectedLine, let idx = lines.firstIndex(where: { $0 === item }) {
+            pushUndo(); lines.remove(at: idx); lines.insert(item, at: 0); markDirty(); needsDisplay = true
+        }
+    }
+
+    func rotateSelected(degrees: CGFloat = 90) {
         guard let item = selectedImage else { return }
         pushUndo()
-        item.rotated90CW()
+        item.rotate(by: degrees)
         markDirty()
         needsDisplay = true
     }
@@ -1162,13 +1352,30 @@ class DocumentView: NSView, NSTextFieldDelegate {
                 guard item.y + item.height > top && item.y < top + PH else { continue }
                 let rect = NSRect(x: item.x, y: item.y - top,
                                   width: item.width, height: item.height)
-                item.image.draw(in: rect, from: .zero, operation: .sourceOver, fraction: item.opacity)
+
+                let hasRotation = abs(item.rotation) > 0.01
+                if hasRotation {
+                    NSGraphicsContext.saveGraphicsState()
+                    let rot = NSAffineTransform()
+                    rot.translateX(by: rect.midX, yBy: rect.midY)
+                    rot.rotate(byDegrees: -item.rotation)
+                    rot.translateX(by: -rect.midX, yBy: -rect.midY)
+                    rot.concat()
+                }
+
+                item.image.draw(in: rect, from: NSRect(origin: .zero, size: item.image.size),
+                                operation: .sourceOver, fraction: item.opacity,
+                                respectFlipped: true, hints: nil)
 
                 if let fc = item.frameColor {
                     fc.setStroke()
                     let bezel = NSBezierPath(rect: rect)
                     bezel.lineWidth = item.frameWidth
                     bezel.stroke()
+                }
+
+                if hasRotation {
+                    NSGraphicsContext.restoreGraphicsState()
                 }
             }
 
@@ -1560,6 +1767,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         rotate.target = self; editMenu.addItem(rotate)
         let grid = NSMenuItem(title: "Toggle Grid", action: #selector(toggleGrid), keyEquivalent: "g")
         grid.target = self; editMenu.addItem(grid)
+        editMenu.addItem(NSMenuItem.separator())
+        let front = NSMenuItem(title: "Bring to Front", action: #selector(doBringToFront), keyEquivalent: "]")
+        front.target = self; editMenu.addItem(front)
+        let back = NSMenuItem(title: "Send to Back", action: #selector(doSendToBack), keyEquivalent: "[")
+        back.target = self; editMenu.addItem(back)
         let editItem = NSMenuItem(); editItem.submenu = editMenu
         mainMenu.addItem(editItem)
 
@@ -1575,6 +1787,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     @objc func duplicateSelected() { doc.duplicateSelected() }
     @objc func doUndo() { doc.undo() }
     @objc func doRedo() { doc.redo() }
+    @objc func doBringToFront() { doc.bringToFront() }
+    @objc func doSendToBack() { doc.sendToBack() }
 
     @objc func addPage() {
         doc.pushUndo(); doc.addPage(); relayout()
@@ -1587,24 +1801,56 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     // ── Window delegate (unsaved changes) ──
 
-    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard doc.isDirty else { return .terminateNow }
+    private var pendingTerminate = false
+    private var closeConfirmed = false
+
+    var hasContent: Bool {
+        !doc.images.isEmpty || !doc.texts.isEmpty || !doc.lines.isEmpty
+    }
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        if closeConfirmed { return true }
+        guard doc.isDirty && hasContent else { return true }
         let alert = NSAlert()
         alert.messageText = "You have unsaved changes."
-        alert.informativeText = "Do you want to save as PDF before quitting?"
+        alert.informativeText = "Do you want to save as PDF before closing?"
         alert.addButton(withTitle: "Save")
         alert.addButton(withTitle: "Don\u{2019}t Save")
         alert.addButton(withTitle: "Cancel")
         alert.alertStyle = .warning
-        let response = alert.runModal()
-        switch response {
-        case .alertFirstButtonReturn:
-            doc.exportPDF()
-            return doc.isDirty ? .terminateCancel : .terminateNow
-        case .alertSecondButtonReturn:
-            return .terminateNow
-        default:
-            return .terminateCancel
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard let self = self else { return }
+            switch response {
+            case .alertFirstButtonReturn:
+                self.doc.exportPDF()
+                if !self.doc.isDirty {
+                    self.closeConfirmed = true
+                    self.window.close()
+                }
+            case .alertSecondButtonReturn:
+                self.closeConfirmed = true
+                self.window.close()
+            default:
+                self.pendingTerminate = false  // Cancel terminates the quit flow too
+            }
+        }
+        return false
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if closeConfirmed { return .terminateNow }
+        guard doc.isDirty && hasContent else { return .terminateNow }
+        pendingTerminate = true
+        window.performClose(nil)
+        return .terminateCancel
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        if pendingTerminate {
+            pendingTerminate = false
+            DispatchQueue.main.async {
+                NSApplication.shared.terminate(nil)
+            }
         }
     }
 
