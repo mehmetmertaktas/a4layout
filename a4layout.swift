@@ -224,6 +224,8 @@ class DocumentView: NSView, NSTextFieldDelegate {
     private var newLineItem: LineItem?
     private var isResizingText = false
     private var itemStartFontSize: CGFloat = 0
+    private var isDraggingLineEndpoint = false  // dragging a single endpoint
+    private var draggingEndpoint: Int = 0       // 1 = start, 2 = end
 
     // Text editing
     private var editingTextField: NSTextField?
@@ -240,6 +242,46 @@ class DocumentView: NSView, NSTextFieldDelegate {
 
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        for ta in trackingAreas { removeTrackingArea(ta) }
+        addTrackingArea(NSTrackingArea(rect: bounds,
+            options: [.mouseMoved, .activeInKeyWindow, .inVisibleRect],
+            owner: self, userInfo: nil))
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        let sp = convert(event.locationInWindow, from: nil)
+        switch mode {
+        case .addText:
+            NSCursor.iBeam.set(); return
+        case .drawLine:
+            NSCursor.crosshair.set(); return
+        case .select:
+            break
+        }
+        // Check resize handles
+        if let item = selectedImage, isOnHandle(screen: sp, item: item) {
+            NSCursor.arrow.set()  // could use a resize cursor
+            return
+        }
+        if let item = selectedText, isOnTextHandle(screen: sp, item: item) {
+            NSCursor.arrow.set()
+            return
+        }
+        if let item = selectedLine, hitLineEndpoint(screen: sp, item: item) != 0 {
+            NSCursor.crosshair.set()
+            return
+        }
+        // Check if over any item
+        let a4 = toA4(sp)
+        if hitImage(at: a4) != nil || hitText(at: a4) != nil || hitLine(at: a4) != nil {
+            NSCursor.openHand.set()
+        } else {
+            NSCursor.arrow.set()
+        }
+    }
 
     var PW: CGFloat { pageSize.width }
     var PH: CGFloat { pageSize.height }
@@ -265,6 +307,8 @@ class DocumentView: NSView, NSTextFieldDelegate {
     private var gestureStartHeight: CGFloat = 0
     private var gestureStartFontSize: CGFloat = 0
     private var gestureStartRotation: CGFloat = 0
+    private var gestureLineStart = NSPoint.zero
+    private var gestureLineEnd = NSPoint.zero
 
     func totalHeight(forWidth w: CGFloat) -> CGFloat {
         let pw = max(100, w - pad * 2)
@@ -537,16 +581,19 @@ class DocumentView: NSView, NSTextFieldDelegate {
                 path.stroke()
 
                 if item.isSelected {
-                    NSColor.controlAccentColor.withAlphaComponent(0.6).setStroke()
+                    NSColor.controlAccentColor.withAlphaComponent(0.5).setStroke()
                     let sp = NSBezierPath()
                     sp.lineWidth = max(1, item.lineWidth * scale + 2)
                     sp.move(to: p1); sp.line(to: p2)
                     sp.stroke()
-                    // Endpoint dots
+                    // Endpoint handles (larger, with white inner)
                     for ep in [p1, p2] {
-                        let dr: CGFloat = 4
+                        let dr: CGFloat = 5
+                        let ov = NSRect(x: ep.x - dr, y: ep.y - dr, width: dr * 2, height: dr * 2)
                         NSColor.controlAccentColor.setFill()
-                        NSBezierPath(ovalIn: NSRect(x: ep.x - dr, y: ep.y - dr, width: dr * 2, height: dr * 2)).fill()
+                        NSBezierPath(ovalIn: ov).fill()
+                        NSColor.white.setFill()
+                        NSBezierPath(ovalIn: ov.insetBy(dx: 1.5, dy: 1.5)).fill()
                     }
                 }
             }
@@ -732,6 +779,15 @@ class DocumentView: NSView, NSTextFieldDelegate {
         return hypot(sp.x - f.maxX, sp.y - f.maxY) < handleR + 6
     }
 
+    /// Returns 1 if near start endpoint, 2 if near end endpoint, 0 if neither.
+    private func hitLineEndpoint(screen sp: NSPoint, item: LineItem) -> Int {
+        let p1 = toScreen(NSPoint(x: item.x1, y: item.y1))
+        let p2 = toScreen(NSPoint(x: item.x2, y: item.y2))
+        if hypot(sp.x - p1.x, sp.y - p1.y) < handleR + 6 { return 1 }
+        if hypot(sp.x - p2.x, sp.y - p2.y) < handleR + 6 { return 2 }
+        return 0
+    }
+
     // ── Mouse events ──
 
     override func mouseDown(with event: NSEvent) {
@@ -803,6 +859,12 @@ class DocumentView: NSView, NSTextFieldDelegate {
                 dragStartScreen = sp
                 itemStartPos = NSPoint(x: hit.x, y: hit.y)
             }
+        } else if let item = selectedLine, hitLineEndpoint(screen: sp, item: item) != 0 {
+            // Drag a single endpoint of the selected line
+            pushUndo()
+            isDraggingLineEndpoint = true
+            draggingEndpoint = hitLineEndpoint(screen: sp, item: item)
+            dragStartScreen = sp
         } else if let hit = hitLine(at: a4) {
             if hit === selectedLine && event.clickCount == 2 {
                 // Double-click: extend line to page edges
@@ -836,6 +898,7 @@ class DocumentView: NSView, NSTextFieldDelegate {
     }
 
     override func mouseDragged(with event: NSEvent) {
+        if isDragging { NSCursor.closedHand.set() }
         let sp = convert(event.locationInWindow, from: nil)
         let dx = (sp.x - dragStartScreen.x) / scale
         let dy = (sp.y - dragStartScreen.y) / scale
@@ -845,15 +908,30 @@ class DocumentView: NSView, NSTextFieldDelegate {
             let rawDx = a4.x - nl.x1, rawDy = a4.y - nl.y1
             let rawLen = hypot(rawDx, rawDy)
             let forceHV = event.modifierFlags.contains(.shift)
-            // Auto-snap to H/V only after a minimum drag distance (avoids jitter at start)
-            var autoSnap = false
-            if rawLen > 15 {
-                let angle = abs(atan2(rawDy, rawDx)) * 180 / .pi
-                autoSnap = angle < 5 || angle > 175 || abs(angle - 90) < 5
-            }
-            if forceHV || autoSnap {
+
+            if forceHV {
+                // Shift: hard lock to H/V
                 let adx = abs(a4.x - nl.x1), ady = abs(a4.y - nl.y1)
                 if adx > ady { a4.y = nl.y1 } else { a4.x = nl.x1 }
+            } else if rawLen > 20 {
+                // Smooth magnetic pull toward H/V
+                // The closer the angle is to 0°/90°/180°/270°, the stronger the pull
+                let angle = atan2(rawDy, rawDx)  // radians
+                let angleDeg = abs(angle) * 180 / .pi
+                // Distance from nearest axis in degrees (0° = horizontal, 90° = vertical)
+                let distFromH = min(angleDeg, abs(180 - angleDeg))  // 0° or 180°
+                let distFromV = abs(90 - angleDeg)                   // 90°
+
+                let magnetZone: CGFloat = 12  // degrees — within this, pull starts
+                let lockZone: CGFloat = 3     // degrees — within this, lock fully
+
+                if distFromH < magnetZone {
+                    let pull = distFromH < lockZone ? 1.0 : (1.0 - (distFromH - lockZone) / (magnetZone - lockZone))
+                    a4.y = nl.y1 + rawDy * (1.0 - pull)
+                } else if distFromV < magnetZone {
+                    let pull = distFromV < lockZone ? 1.0 : (1.0 - (distFromV - lockZone) / (magnetZone - lockZone))
+                    a4.x = nl.x1 + rawDx * (1.0 - pull)
+                }
             }
             nl.x2 = a4.x; nl.y2 = a4.y
             // Snap line endpoints to page edges/center and other items
@@ -881,7 +959,42 @@ class DocumentView: NSView, NSTextFieldDelegate {
             return
         }
 
-        if isResizingText, let item = selectedText {
+        if isDraggingLineEndpoint, let item = selectedLine {
+            let a4 = toA4(sp)
+            if draggingEndpoint == 1 { item.x1 = a4.x; item.y1 = a4.y }
+            else { item.x2 = a4.x; item.y2 = a4.y }
+            // Magnetic H/V pull for endpoint editing too
+            let anchorX = draggingEndpoint == 1 ? item.x2 : item.x1
+            let anchorY = draggingEndpoint == 1 ? item.y2 : item.y1
+            let epX = draggingEndpoint == 1 ? item.x1 : item.x2
+            let epY = draggingEndpoint == 1 ? item.y1 : item.y2
+            let eDx = epX - anchorX, eDy = epY - anchorY
+            let eLen = hypot(eDx, eDy)
+            if eLen > 20 && !event.modifierFlags.contains(.shift) {
+                let angle = atan2(eDy, eDx)
+                let deg = abs(angle) * 180 / .pi
+                let distH = min(deg, abs(180 - deg))
+                let distV = abs(90 - deg)
+                let mag: CGFloat = 12, lock: CGFloat = 3
+                if distH < mag {
+                    let pull = distH < lock ? 1.0 : (1.0 - (distH - lock) / (mag - lock))
+                    let newY = anchorY + eDy * (1.0 - pull)
+                    if draggingEndpoint == 1 { item.y1 = newY } else { item.y2 = newY }
+                } else if distV < mag {
+                    let pull = distV < lock ? 1.0 : (1.0 - (distV - lock) / (mag - lock))
+                    let newX = anchorX + eDx * (1.0 - pull)
+                    if draggingEndpoint == 1 { item.x1 = newX } else { item.x2 = newX }
+                }
+            } else if event.modifierFlags.contains(.shift) {
+                let adx = abs(eDx), ady = abs(eDy)
+                if adx > ady {
+                    if draggingEndpoint == 1 { item.y1 = anchorY } else { item.y2 = anchorY }
+                } else {
+                    if draggingEndpoint == 1 { item.x1 = anchorX } else { item.x2 = anchorX }
+                }
+            }
+            markDirty(); needsDisplay = true
+        } else if isResizingText, let item = selectedText {
             let newW = max(10, itemStartWidth + dx)
             let ratio = newW / itemStartWidth
             item.fontSize = min(200, max(6, itemStartFontSize * ratio))
@@ -959,7 +1072,9 @@ class DocumentView: NSView, NSTextFieldDelegate {
         isDragging = false
         isResizing = false
         isResizingText = false
+        isDraggingLineEndpoint = false
         activeGuides = []
+        NSCursor.arrow.set()
         needsDisplay = true
     }
 
@@ -974,6 +1089,10 @@ class DocumentView: NSView, NSTextFieldDelegate {
             } else if let item = selectedText {
                 pushUndo()
                 gestureStartFontSize = item.fontSize
+            } else if let item = selectedLine {
+                pushUndo()
+                gestureLineStart = NSPoint(x: item.x1, y: item.y1)
+                gestureLineEnd = NSPoint(x: item.x2, y: item.y2)
             }
         } else if gesture.state == .changed {
             let s = 1 + gesture.magnification
@@ -988,41 +1107,99 @@ class DocumentView: NSView, NSTextFieldDelegate {
             } else if let item = selectedText {
                 item.fontSize = min(200, max(6, gestureStartFontSize * s))
                 markDirty(); needsDisplay = true
+            } else if let item = selectedLine {
+                // Scale line around midpoint
+                let mx = (gestureLineStart.x + gestureLineEnd.x) / 2
+                let my = (gestureLineStart.y + gestureLineEnd.y) / 2
+                item.x1 = mx + (gestureLineStart.x - mx) * s
+                item.y1 = my + (gestureLineStart.y - my) * s
+                item.x2 = mx + (gestureLineEnd.x - mx) * s
+                item.y2 = my + (gestureLineEnd.y - my) * s
+                markDirty(); needsDisplay = true
             }
         }
     }
 
-    private var lastHapticAngle: CGFloat = -1  // track last haptic-fired right angle
+    private var rotationSnappedTo: CGFloat = -1  // currently locked angle, -1 = not snapped
     private lazy var hapticPerformer = NSHapticFeedbackManager.defaultPerformer
+    private let rotationSnapThreshold: CGFloat = 3   // degrees to enter snap
+    private let rotationEscapeThreshold: CGFloat = 8 // degrees to break free
 
     @objc func handleRotate(_ gesture: NSRotationGestureRecognizer) {
+        // Rotate images or lines
+        if let line = selectedLine {
+            handleRotateLine(gesture, line: line)
+            return
+        }
         guard let item = selectedImage else { return }
         if gesture.state == .began {
             pushUndo()
             gestureStartRotation = item.rotation
-            lastHapticAngle = -1
+            rotationSnappedTo = -1
         } else if gesture.state == .changed {
             let degrees = gesture.rotation * 180 / .pi
-            item.rotation = gestureStartRotation - CGFloat(degrees)
-            // Normalize
-            item.rotation = item.rotation.truncatingRemainder(dividingBy: 360)
-            if item.rotation < 0 { item.rotation += 360 }
+            var raw = gestureStartRotation - CGFloat(degrees)
+            raw = raw.truncatingRemainder(dividingBy: 360)
+            if raw < 0 { raw += 360 }
 
-            // Haptic feedback at right angles (0°, 90°, 180°, 270°)
+            // Snap logic: sticky detent at 0°, 90°, 180°, 270°
             let snapAngles: [CGFloat] = [0, 90, 180, 270, 360]
+
+            if rotationSnappedTo >= 0 {
+                // Currently snapped — hold until escape threshold
+                var minDist: CGFloat = .greatestFiniteMagnitude
+                for sa in snapAngles {
+                    minDist = min(minDist, min(abs(raw - sa), abs(raw - sa + 360), abs(raw - sa - 360)))
+                }
+                let distFromSnap = min(abs(raw - rotationSnappedTo),
+                                        abs(raw - rotationSnappedTo + 360),
+                                        abs(raw - rotationSnappedTo - 360))
+                if distFromSnap < rotationEscapeThreshold {
+                    // Stay locked
+                    item.rotation = rotationSnappedTo == 360 ? 0 : rotationSnappedTo
+                    markDirty(); needsDisplay = true
+                    return
+                }
+                // Escaped
+                rotationSnappedTo = -1
+            }
+
+            // Check if we should snap
             for sa in snapAngles {
-                let dist = abs(item.rotation - sa)
-                if dist < 2 && lastHapticAngle != sa {
-                    hapticPerformer.perform(.alignment, performanceTime: .now)
-                    lastHapticAngle = sa
-                    // Snap exactly to the right angle for precision
+                let dist = min(abs(raw - sa), abs(raw - sa + 360), abs(raw - sa - 360))
+                if dist < rotationSnapThreshold {
+                    if rotationSnappedTo != sa {
+                        hapticPerformer.perform(.alignment, performanceTime: .now)
+                        rotationSnappedTo = sa
+                    }
                     item.rotation = sa == 360 ? 0 : sa
-                    break
-                } else if dist >= 5 && lastHapticAngle == sa {
-                    lastHapticAngle = -1  // reset once we move away
+                    markDirty(); needsDisplay = true
+                    return
                 }
             }
 
+            item.rotation = raw
+            markDirty(); needsDisplay = true
+        }
+    }
+
+    private func handleRotateLine(_ gesture: NSRotationGestureRecognizer, line: LineItem) {
+        if gesture.state == .began {
+            pushUndo()
+            gestureLineStart = NSPoint(x: line.x1, y: line.y1)
+            gestureLineEnd = NSPoint(x: line.x2, y: line.y2)
+        } else if gesture.state == .changed {
+            let angle = -CGFloat(gesture.rotation)  // radians
+            let midX = (gestureLineStart.x + gestureLineEnd.x) / 2
+            let midY = (gestureLineStart.y + gestureLineEnd.y) / 2
+            let cosA = cos(angle), sinA = sin(angle)
+            // Rotate both endpoints around midpoint
+            let dx1 = gestureLineStart.x - midX, dy1 = gestureLineStart.y - midY
+            line.x1 = midX + dx1 * cosA - dy1 * sinA
+            line.y1 = midY + dx1 * sinA + dy1 * cosA
+            let dx2 = gestureLineEnd.x - midX, dy2 = gestureLineEnd.y - midY
+            line.x2 = midX + dx2 * cosA - dy2 * sinA
+            line.y2 = midY + dx2 * sinA + dy2 * cosA
             markDirty(); needsDisplay = true
         }
     }
@@ -1263,11 +1440,24 @@ class DocumentView: NSView, NSTextFieldDelegate {
     }
 
     func rotateSelected(degrees: CGFloat = 90) {
-        guard let item = selectedImage else { return }
-        pushUndo()
-        item.rotate(by: degrees)
-        markDirty()
-        needsDisplay = true
+        if let item = selectedImage {
+            pushUndo()
+            item.rotate(by: degrees)
+            markDirty(); needsDisplay = true
+        } else if let item = selectedLine {
+            // Rotate line around its midpoint
+            pushUndo()
+            let rad = degrees * .pi / 180
+            let mx = (item.x1 + item.x2) / 2, my = (item.y1 + item.y2) / 2
+            let cosA = cos(rad), sinA = sin(rad)
+            let dx1 = item.x1 - mx, dy1 = item.y1 - my
+            item.x1 = mx + dx1 * cosA - dy1 * sinA
+            item.y1 = my + dx1 * sinA + dy1 * cosA
+            let dx2 = item.x2 - mx, dy2 = item.y2 - my
+            item.x2 = mx + dx2 * cosA - dy2 * sinA
+            item.y2 = my + dx2 * sinA + dy2 * cosA
+            markDirty(); needsDisplay = true
+        }
     }
 
     func setSelectedOpacity(_ val: CGFloat) {
@@ -1279,19 +1469,27 @@ class DocumentView: NSView, NSTextFieldDelegate {
     }
 
     func setSelectedFrameColor(_ color: NSColor?) {
-        guard let item = selectedImage else { return }
-        pushUndo()
-        item.frameColor = color
-        markDirty()
-        needsDisplay = true
+        if let item = selectedImage {
+            pushUndo()
+            item.frameColor = color
+            markDirty(); needsDisplay = true
+        } else if let item = selectedLine, let c = color {
+            pushUndo()
+            item.color = c
+            markDirty(); needsDisplay = true
+        }
     }
 
     func setSelectedFrameWidth(_ w: CGFloat) {
-        guard let item = selectedImage else { return }
-        pushUndo()
-        item.frameWidth = w
-        markDirty()
-        needsDisplay = true
+        if let item = selectedImage {
+            pushUndo()
+            item.frameWidth = w
+            markDirty(); needsDisplay = true
+        } else if let item = selectedLine {
+            pushUndo()
+            item.lineWidth = w
+            markDirty(); needsDisplay = true
+        }
     }
 
     func toggleFrame() {
@@ -1660,8 +1858,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func updateToolbarForSelection() {
         let hasImg = doc.selectedImage != nil
-        framePopup.isEnabled = hasImg
-        frameWidthPopup.isEnabled = hasImg
+        let hasLine = doc.selectedLine != nil
+        framePopup.isEnabled = hasImg || hasLine
+        frameWidthPopup.isEnabled = hasImg || hasLine
         opacitySlider.isEnabled = hasImg
 
         // Highlight active mode
@@ -1683,6 +1882,19 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             if item.frameWidth <= 0.5 { frameWidthPopup.selectItem(at: 0) }
             else if item.frameWidth <= 1 { frameWidthPopup.selectItem(at: 1) }
             else { frameWidthPopup.selectItem(at: 2) }
+        } else if let item = doc.selectedLine {
+            // Show line properties in color/width popups
+            let c = item.color
+            if c == .black { framePopup.selectItem(at: 1) }
+            else if c == NSColor.darkGray { framePopup.selectItem(at: 2) }
+            else if c == .red { framePopup.selectItem(at: 3) }
+            else if c == .blue { framePopup.selectItem(at: 4) }
+            else { framePopup.selectItem(at: 1) }
+            if item.lineWidth <= 0.5 { frameWidthPopup.selectItem(at: 0) }
+            else if item.lineWidth <= 1 { frameWidthPopup.selectItem(at: 1) }
+            else { frameWidthPopup.selectItem(at: 2) }
+            opacitySlider.doubleValue = 1.0
+            opacityLabel.stringValue = "100%"
         } else {
             opacitySlider.doubleValue = 1.0
             opacityLabel.stringValue = "100%"
