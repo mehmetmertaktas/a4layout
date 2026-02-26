@@ -582,10 +582,10 @@ class DocumentView: NSView, NSTextFieldDelegate {
 
                 if item.isSelected {
                     NSColor.controlAccentColor.withAlphaComponent(0.5).setStroke()
-                    let sp = NSBezierPath()
-                    sp.lineWidth = max(1, item.lineWidth * scale + 2)
-                    sp.move(to: p1); sp.line(to: p2)
-                    sp.stroke()
+                    let selPath = NSBezierPath()
+                    selPath.lineWidth = max(1, item.lineWidth * scale + 2)
+                    selPath.move(to: p1); selPath.line(to: p2)
+                    selPath.stroke()
                     // Endpoint handles (larger, with white inner)
                     for ep in [p1, p2] {
                         let dr: CGFloat = 5
@@ -595,6 +595,29 @@ class DocumentView: NSView, NSTextFieldDelegate {
                         NSColor.white.setFill()
                         NSBezierPath(ovalIn: ov.insetBy(dx: 1.5, dy: 1.5)).fill()
                     }
+                    // Rotation angle badge at midpoint
+                    let mid = NSPoint(x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2)
+                    var angleDeg = atan2(item.y2 - item.y1, item.x2 - item.x1) * 180 / .pi
+                    if angleDeg < 0 { angleDeg += 360 }
+                    // Normalize to nearest display angle
+                    let displayAngle = abs(angleDeg) < 0.5 || abs(angleDeg - 360) < 0.5 ? 0 : angleDeg
+                    let label = String(format: "%.1f°", displayAngle) as NSString
+                    let badgeFont = NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .medium)
+                    let badgeAttrs: [NSAttributedString.Key: Any] = [
+                        .font: badgeFont,
+                        .foregroundColor: NSColor.white
+                    ]
+                    let labelSz = label.size(withAttributes: badgeAttrs)
+                    let badgePad: CGFloat = 3
+                    let badgeRect = NSRect(x: mid.x - labelSz.width / 2 - badgePad,
+                                           y: mid.y - labelSz.height - 10,
+                                           width: labelSz.width + badgePad * 2,
+                                           height: labelSz.height + badgePad)
+                    NSColor.controlAccentColor.withAlphaComponent(0.85).setFill()
+                    NSBezierPath(roundedRect: badgeRect, xRadius: 3, yRadius: 3).fill()
+                    label.draw(at: NSPoint(x: badgeRect.minX + badgePad,
+                                           y: badgeRect.minY + badgePad / 2),
+                               withAttributes: badgeAttrs)
                 }
             }
 
@@ -646,6 +669,27 @@ class DocumentView: NSView, NSTextFieldDelegate {
                     NSBezierPath(ovalIn: ov).fill()
                     NSColor.white.setFill()
                     NSBezierPath(ovalIn: ov.insetBy(dx: 1.5, dy: 1.5)).fill()
+                    // Rotation angle badge (only when rotated)
+                    if hasRotation {
+                        let displayAngle = abs(item.rotation) < 0.5 || abs(item.rotation - 360) < 0.5 ? 0 : item.rotation
+                        let label = String(format: "%.1f°", displayAngle) as NSString
+                        let badgeFont = NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .medium)
+                        let badgeAttrs: [NSAttributedString.Key: Any] = [
+                            .font: badgeFont,
+                            .foregroundColor: NSColor.white
+                        ]
+                        let labelSz = label.size(withAttributes: badgeAttrs)
+                        let badgePad: CGFloat = 3
+                        let badgeRect = NSRect(x: f.midX - labelSz.width / 2 - badgePad,
+                                               y: f.minY - labelSz.height - badgePad - 4,
+                                               width: labelSz.width + badgePad * 2,
+                                               height: labelSz.height + badgePad)
+                        NSColor.controlAccentColor.withAlphaComponent(0.85).setFill()
+                        NSBezierPath(roundedRect: badgeRect, xRadius: 3, yRadius: 3).fill()
+                        label.draw(at: NSPoint(x: badgeRect.minX + badgePad,
+                                               y: badgeRect.minY + badgePad / 2),
+                                   withAttributes: badgeAttrs)
+                    }
                 }
             }
 
@@ -1183,25 +1227,79 @@ class DocumentView: NSView, NSTextFieldDelegate {
         }
     }
 
+    private var lineRotationSnappedTo: CGFloat = -1  // snapped line angle in degrees, -1 = free
+    private var lineGestureAngleRad: CGFloat = 0     // raw gesture rotation in radians
+
     private func handleRotateLine(_ gesture: NSRotationGestureRecognizer, line: LineItem) {
         if gesture.state == .began {
             pushUndo()
             gestureLineStart = NSPoint(x: line.x1, y: line.y1)
             gestureLineEnd = NSPoint(x: line.x2, y: line.y2)
+            lineRotationSnappedTo = -1
+            lineGestureAngleRad = 0
         } else if gesture.state == .changed {
-            let angle = -CGFloat(gesture.rotation)  // radians
+            let rawAngle = -CGFloat(gesture.rotation)  // radians
             let midX = (gestureLineStart.x + gestureLineEnd.x) / 2
             let midY = (gestureLineStart.y + gestureLineEnd.y) / 2
-            let cosA = cos(angle), sinA = sin(angle)
-            // Rotate both endpoints around midpoint
+
+            // Compute what the resulting line angle would be
+            let cosA = cos(rawAngle), sinA = sin(rawAngle)
+            let dx2 = gestureLineEnd.x - midX, dy2 = gestureLineEnd.y - midY
+            let newDx = dx2 * cosA - dy2 * sinA
+            let newDy = dx2 * sinA + dy2 * cosA
+            var lineAngle = atan2(newDy, newDx) * 180 / .pi
+            if lineAngle < 0 { lineAngle += 360 }
+
+            // Snap at H/V (0°, 90°, 180°, 270°)
+            let snapAngles: [CGFloat] = [0, 90, 180, 270, 360]
+
+            if lineRotationSnappedTo >= 0 {
+                // Currently snapped — hold until escape
+                let distFromSnap = min(abs(lineAngle - lineRotationSnappedTo),
+                                        abs(lineAngle - lineRotationSnappedTo + 360),
+                                        abs(lineAngle - lineRotationSnappedTo - 360))
+                if distFromSnap < rotationEscapeThreshold {
+                    // Stay locked — compute the angle that makes the line exactly at snap
+                    applyLineSnap(line: line, snapDeg: lineRotationSnappedTo,
+                                  midX: midX, midY: midY)
+                    markDirty(); needsDisplay = true
+                    return
+                }
+                lineRotationSnappedTo = -1
+            }
+
+            // Check if we should snap
+            for sa in snapAngles {
+                let dist = min(abs(lineAngle - sa), abs(lineAngle - sa + 360), abs(lineAngle - sa - 360))
+                if dist < rotationSnapThreshold {
+                    if lineRotationSnappedTo != sa {
+                        hapticPerformer.perform(.alignment, performanceTime: .now)
+                        lineRotationSnappedTo = sa
+                    }
+                    applyLineSnap(line: line, snapDeg: sa, midX: midX, midY: midY)
+                    markDirty(); needsDisplay = true
+                    return
+                }
+            }
+
+            // Free rotation
             let dx1 = gestureLineStart.x - midX, dy1 = gestureLineStart.y - midY
             line.x1 = midX + dx1 * cosA - dy1 * sinA
             line.y1 = midY + dx1 * sinA + dy1 * cosA
-            let dx2 = gestureLineEnd.x - midX, dy2 = gestureLineEnd.y - midY
-            line.x2 = midX + dx2 * cosA - dy2 * sinA
-            line.y2 = midY + dx2 * sinA + dy2 * cosA
+            line.x2 = midX + newDx
+            line.y2 = midY + newDy
             markDirty(); needsDisplay = true
         }
+    }
+
+    /// Snap a line to an exact angle (degrees) around its midpoint, preserving length.
+    private func applyLineSnap(line: LineItem, snapDeg: CGFloat, midX: CGFloat, midY: CGFloat) {
+        let halfLen = hypot(gestureLineEnd.x - gestureLineStart.x,
+                            gestureLineEnd.y - gestureLineStart.y) / 2
+        let rad = (snapDeg == 360 ? 0 : snapDeg) * .pi / 180
+        let hx = halfLen * cos(rad), hy = halfLen * sin(rad)
+        line.x1 = midX - hx; line.y1 = midY - hy
+        line.x2 = midX + hx; line.y2 = midY + hy
     }
 
     // ── Keyboard ──
