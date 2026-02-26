@@ -843,11 +843,15 @@ class DocumentView: NSView, NSTextFieldDelegate {
         if isDrawingLine, let nl = newLineItem {
             var a4 = toA4(sp)
             let rawDx = a4.x - nl.x1, rawDy = a4.y - nl.y1
-            let angle = abs(atan2(rawDy, rawDx)) * 180 / .pi
-            let nearH = angle < 5 || angle > 175
-            let nearV = abs(angle - 90) < 5
-            // Shift forces H/V; also auto-snap if angle within 5°
-            if event.modifierFlags.contains(.shift) || nearH || nearV {
+            let rawLen = hypot(rawDx, rawDy)
+            let forceHV = event.modifierFlags.contains(.shift)
+            // Auto-snap to H/V only after a minimum drag distance (avoids jitter at start)
+            var autoSnap = false
+            if rawLen > 15 {
+                let angle = abs(atan2(rawDy, rawDx)) * 180 / .pi
+                autoSnap = angle < 5 || angle > 175 || abs(angle - 90) < 5
+            }
+            if forceHV || autoSnap {
                 let adx = abs(a4.x - nl.x1), ady = abs(a4.y - nl.y1)
                 if adx > ady { a4.y = nl.y1 } else { a4.x = nl.x1 }
             }
@@ -988,17 +992,37 @@ class DocumentView: NSView, NSTextFieldDelegate {
         }
     }
 
+    private var lastHapticAngle: CGFloat = -1  // track last haptic-fired right angle
+    private lazy var hapticPerformer = NSHapticFeedbackManager.defaultPerformer
+
     @objc func handleRotate(_ gesture: NSRotationGestureRecognizer) {
         guard let item = selectedImage else { return }
         if gesture.state == .began {
             pushUndo()
             gestureStartRotation = item.rotation
+            lastHapticAngle = -1
         } else if gesture.state == .changed {
             let degrees = gesture.rotation * 180 / .pi
             item.rotation = gestureStartRotation - CGFloat(degrees)
             // Normalize
             item.rotation = item.rotation.truncatingRemainder(dividingBy: 360)
             if item.rotation < 0 { item.rotation += 360 }
+
+            // Haptic feedback at right angles (0°, 90°, 180°, 270°)
+            let snapAngles: [CGFloat] = [0, 90, 180, 270, 360]
+            for sa in snapAngles {
+                let dist = abs(item.rotation - sa)
+                if dist < 2 && lastHapticAngle != sa {
+                    hapticPerformer.perform(.alignment, performanceTime: .now)
+                    lastHapticAngle = sa
+                    // Snap exactly to the right angle for precision
+                    item.rotation = sa == 360 ? 0 : sa
+                    break
+                } else if dist >= 5 && lastHapticAngle == sa {
+                    lastHapticAngle = -1  // reset once we move away
+                }
+            }
+
             markDirty(); needsDisplay = true
         }
     }
@@ -1513,10 +1537,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         textModeBtn = makeIconBtn("textformat", tip: "Add text — click on page",
                                    action: #selector(enterTextMode))
+        textModeBtn.setButtonType(.pushOnPushOff)
         stack.addArrangedSubview(textModeBtn)
 
         lineModeBtn = makeIconBtn("line.diagonal", tip: "Draw line — click and drag",
                                    action: #selector(enterLineMode))
+        lineModeBtn.setButtonType(.pushOnPushOff)
         stack.addArrangedSubview(lineModeBtn)
 
         stack.addArrangedSubview(makeDivider())
