@@ -60,6 +60,9 @@ class TextItem {
     var y: CGFloat
     var fontSize: CGFloat
     var color: NSColor
+    var isBold = false
+    var isItalic = false
+    var rotation: CGFloat = 0
     var isSelected = false
 
     init(text: String, x: CGFloat, y: CGFloat, fontSize: CGFloat = 16, color: NSColor = .black) {
@@ -70,11 +73,21 @@ class TextItem {
     func clone(offsetX: CGFloat = 15, offsetY: CGFloat = 15) -> TextItem {
         let c = TextItem(text: text, x: x + offsetX, y: y + offsetY,
                          fontSize: fontSize, color: color)
+        c.isBold = isBold; c.isItalic = isItalic; c.rotation = rotation
         return c
     }
 
+    var fontName: String {
+        switch (isBold, isItalic) {
+        case (true, true):   return "Helvetica-BoldOblique"
+        case (true, false):  return "Helvetica-Bold"
+        case (false, true):  return "Helvetica-Oblique"
+        case (false, false): return "Helvetica"
+        }
+    }
+
     var font: NSFont {
-        NSFont(name: "Helvetica", size: fontSize) ?? NSFont.systemFont(ofSize: fontSize)
+        NSFont(name: fontName, size: fontSize) ?? NSFont.systemFont(ofSize: fontSize)
     }
 
     var attrs: [NSAttributedString.Key: Any] {
@@ -134,6 +147,7 @@ struct UndoSnapshot {
     }
     struct TxtSnap {
         let text: String; let x, y, fontSize: CGFloat; let color: NSColor
+        let isBold: Bool; let isItalic: Bool; let rotation: CGFloat
     }
     struct LnSnap {
         let x1, y1, x2, y2, lineWidth: CGFloat; let color: NSColor
@@ -143,6 +157,7 @@ struct UndoSnapshot {
     let lines: [LnSnap]
     let numPages: Int
     let pageSize: PageSize
+    let isLandscape: Bool
     let bgColor: NSColor
 }
 
@@ -197,11 +212,14 @@ class DocumentView: NSView, NSTextFieldDelegate {
 
     var numPages = 1
     var pageSize: PageSize = .a4
+    var isLandscape = false
     var bgColor: NSColor = .white
     var showGrid = false
 
     var mode: InteractionMode = .select
     var isDirty = false
+    var defaultTextColor: NSColor = .black
+    var defaultFontSize: CGFloat = 16
     var onRelayout: (() -> Void)?
     var onDirtyChanged: (() -> Void)?
     var onSelectionChanged: (() -> Void)?
@@ -226,6 +244,11 @@ class DocumentView: NSView, NSTextFieldDelegate {
     private var itemStartFontSize: CGFloat = 0
     private var isDraggingLineEndpoint = false  // dragging a single endpoint
     private var draggingEndpoint: Int = 0       // 1 = start, 2 = end
+    private var isRotatingWithMouse = false
+    private var mouseRotationStartAngle: CGFloat = 0       // radians
+    private var mouseRotationItemStartRotation: CGFloat = 0 // degrees (for image/text)
+    private var mouseRotLineStart = NSPoint.zero            // line initial endpoints
+    private var mouseRotLineEnd = NSPoint.zero
 
     // Text editing
     private var editingTextField: NSTextField?
@@ -235,6 +258,7 @@ class DocumentView: NSView, NSTextFieldDelegate {
     private var activeGuides: [SnapGuide] = []
 
     private let handleR: CGFloat = 5
+    private let rotHandleOffset: CGFloat = 20
     let pad: CGFloat = 28
     let gap: CGFloat = 24
     private let addBtnSize: CGFloat = 32
@@ -261,9 +285,19 @@ class DocumentView: NSView, NSTextFieldDelegate {
         case .select:
             break
         }
+        // Check rotation handles
+        if let item = selectedImage, isOnRotationHandle(screen: sp, item: item) {
+            NSCursor.crosshair.set(); return
+        }
+        if let item = selectedText, isOnTextRotationHandle(screen: sp, item: item) {
+            NSCursor.crosshair.set(); return
+        }
+        if let item = selectedLine, isOnLineRotationHandle(screen: sp, item: item) {
+            NSCursor.crosshair.set(); return
+        }
         // Check resize handles
         if let item = selectedImage, isOnHandle(screen: sp, item: item) {
-            NSCursor.arrow.set()  // could use a resize cursor
+            NSCursor.arrow.set()
             return
         }
         if let item = selectedText, isOnTextHandle(screen: sp, item: item) {
@@ -283,8 +317,8 @@ class DocumentView: NSView, NSTextFieldDelegate {
         }
     }
 
-    var PW: CGFloat { pageSize.width }
-    var PH: CGFloat { pageSize.height }
+    var PW: CGFloat { isLandscape ? pageSize.height : pageSize.width }
+    var PH: CGFloat { isLandscape ? pageSize.width : pageSize.height }
 
     var pageW: CGFloat { max(100, bounds.width - pad * 2) }
     var scale: CGFloat { pageW / PW }
@@ -367,10 +401,11 @@ class DocumentView: NSView, NSTextFieldDelegate {
                                         opacity: $0.opacity, frameWidth: $0.frameWidth,
                                         frameColor: $0.frameColor, rotation: $0.rotation) },
             texts: texts.map { .init(text: $0.text, x: $0.x, y: $0.y,
-                                      fontSize: $0.fontSize, color: $0.color) },
+                                      fontSize: $0.fontSize, color: $0.color,
+                                      isBold: $0.isBold, isItalic: $0.isItalic, rotation: $0.rotation) },
             lines: lines.map { .init(x1: $0.x1, y1: $0.y1, x2: $0.x2, y2: $0.y2,
                                       lineWidth: $0.lineWidth, color: $0.color) },
-            numPages: numPages, pageSize: pageSize, bgColor: bgColor
+            numPages: numPages, pageSize: pageSize, isLandscape: isLandscape, bgColor: bgColor
         )
         undoStack.append(snap)
         if undoStack.count > maxUndo { undoStack.removeFirst() }
@@ -386,11 +421,14 @@ class DocumentView: NSView, NSTextFieldDelegate {
             it.frameColor = s.frameColor; it.rotation = s.rotation
             return it
         }
-        texts = snap.texts.map { TextItem(text: $0.text, x: $0.x, y: $0.y,
-                                            fontSize: $0.fontSize, color: $0.color) }
+        texts = snap.texts.map { s in
+            let t = TextItem(text: s.text, x: s.x, y: s.y, fontSize: s.fontSize, color: s.color)
+            t.isBold = s.isBold; t.isItalic = s.isItalic; t.rotation = s.rotation
+            return t
+        }
         lines = snap.lines.map { LineItem(x1: $0.x1, y1: $0.y1, x2: $0.x2, y2: $0.y2,
                                             color: $0.color, lineWidth: $0.lineWidth) }
-        numPages = snap.numPages; pageSize = snap.pageSize; bgColor = snap.bgColor
+        numPages = snap.numPages; pageSize = snap.pageSize; isLandscape = snap.isLandscape; bgColor = snap.bgColor
         markDirty()
         onRelayout?()
         needsDisplay = true
@@ -405,10 +443,11 @@ class DocumentView: NSView, NSTextFieldDelegate {
                                         opacity: $0.opacity, frameWidth: $0.frameWidth,
                                         frameColor: $0.frameColor, rotation: $0.rotation) },
             texts: texts.map { .init(text: $0.text, x: $0.x, y: $0.y,
-                                      fontSize: $0.fontSize, color: $0.color) },
+                                      fontSize: $0.fontSize, color: $0.color,
+                                      isBold: $0.isBold, isItalic: $0.isItalic, rotation: $0.rotation) },
             lines: lines.map { .init(x1: $0.x1, y1: $0.y1, x2: $0.x2, y2: $0.y2,
                                       lineWidth: $0.lineWidth, color: $0.color) },
-            numPages: numPages, pageSize: pageSize, bgColor: bgColor
+            numPages: numPages, pageSize: pageSize, isLandscape: isLandscape, bgColor: bgColor
         )
         redoStack.append(cur)
         restoreSnapshot(snap)
@@ -422,10 +461,11 @@ class DocumentView: NSView, NSTextFieldDelegate {
                                         opacity: $0.opacity, frameWidth: $0.frameWidth,
                                         frameColor: $0.frameColor, rotation: $0.rotation) },
             texts: texts.map { .init(text: $0.text, x: $0.x, y: $0.y,
-                                      fontSize: $0.fontSize, color: $0.color) },
+                                      fontSize: $0.fontSize, color: $0.color,
+                                      isBold: $0.isBold, isItalic: $0.isItalic, rotation: $0.rotation) },
             lines: lines.map { .init(x1: $0.x1, y1: $0.y1, x2: $0.x2, y2: $0.y2,
                                       lineWidth: $0.lineWidth, color: $0.color) },
-            numPages: numPages, pageSize: pageSize, bgColor: bgColor
+            numPages: numPages, pageSize: pageSize, isLandscape: isLandscape, bgColor: bgColor
         )
         undoStack.append(cur)
         restoreSnapshot(snap)
@@ -494,6 +534,37 @@ class DocumentView: NSView, NSTextFieldDelegate {
             let oly = other.y - CGFloat(op) * PH
             txEdges.append(contentsOf: [other.x, other.x + other.width / 2, other.x + other.width])
             tyEdges.append(contentsOf: [oly, oly + other.height / 2, oly + other.height])
+        }
+        let sx = snapAxis(dragEdges: dxEdges, targetEdges: txEdges, threshold: snapThreshold)
+        let sy = snapAxis(dragEdges: dyEdges, targetEdges: tyEdges, threshold: snapThreshold)
+        var guides: [SnapGuide] = []
+        for pos in sx.positions { guides.append(SnapGuide(axis: .vertical, a4Pos: pos, page: page)) }
+        for pos in sy.positions { guides.append(SnapGuide(axis: .horizontal, a4Pos: pos, page: page)) }
+        return (sx.snapped ? sx.delta : 0, sy.snapped ? sy.delta : 0, guides)
+    }
+
+    func computeTextSnaps(for item: TextItem) -> (dx: CGFloat, dy: CGFloat, guides: [SnapGuide]) {
+        let sz = item.size
+        let page = min(max(0, Int(item.y / PH)), numPages - 1)
+        let localY = item.y - CGFloat(page) * PH
+        let dxEdges = [item.x, item.x + sz.width / 2, item.x + sz.width]
+        let dyEdges = [localY, localY + sz.height / 2, localY + sz.height]
+        var txEdges: [CGFloat] = [0, PW / 2, PW]
+        var tyEdges: [CGFloat] = [0, PH / 2, PH]
+        for img in images {
+            let op = min(max(0, Int(img.y / PH)), numPages - 1)
+            guard op == page else { continue }
+            let oly = img.y - CGFloat(op) * PH
+            txEdges.append(contentsOf: [img.x, img.x + img.width / 2, img.x + img.width])
+            tyEdges.append(contentsOf: [oly, oly + img.height / 2, oly + img.height])
+        }
+        for other in texts where other !== item {
+            let op = min(max(0, Int(other.y / PH)), numPages - 1)
+            guard op == page else { continue }
+            let oly = other.y - CGFloat(op) * PH
+            let osz = other.size
+            txEdges.append(contentsOf: [other.x, other.x + osz.width / 2, other.x + osz.width])
+            tyEdges.append(contentsOf: [oly, oly + osz.height / 2, oly + osz.height])
         }
         let sx = snapAxis(dragEdges: dxEdges, targetEdges: txEdges, threshold: snapThreshold)
         let sy = snapAxis(dragEdges: dyEdges, targetEdges: tyEdges, threshold: snapThreshold)
@@ -595,8 +666,35 @@ class DocumentView: NSView, NSTextFieldDelegate {
                         NSColor.white.setFill()
                         NSBezierPath(ovalIn: ov.insetBy(dx: 1.5, dy: 1.5)).fill()
                     }
-                    // Rotation angle badge at midpoint
+                    // Rotation handle (perpendicular from midpoint, green)
                     let mid = NSPoint(x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2)
+                    let lineDx = p2.x - p1.x, lineDy = p2.y - p1.y
+                    let lineLen = hypot(lineDx, lineDy)
+                    if lineLen > 1 {
+                        let perpX = -lineDy / lineLen, perpY = lineDx / lineLen
+                        let lsign: CGFloat = perpY < 0 ? 1.0 : -1.0
+                        let lrhCenter = NSPoint(x: mid.x + lsign * perpX * rotHandleOffset,
+                                                 y: mid.y + lsign * perpY * rotHandleOffset)
+                        NSColor.systemGreen.withAlphaComponent(0.7).setStroke()
+                        let lStemPath = NSBezierPath()
+                        lStemPath.lineWidth = 1
+                        lStemPath.move(to: mid)
+                        lStemPath.line(to: lrhCenter)
+                        lStemPath.stroke()
+                        let lrhOv = NSRect(x: lrhCenter.x - handleR, y: lrhCenter.y - handleR,
+                                            width: handleR * 2, height: handleR * 2)
+                        NSColor.systemGreen.setFill()
+                        NSBezierPath(ovalIn: lrhOv).fill()
+                        NSColor.white.setFill()
+                        NSBezierPath(ovalIn: lrhOv.insetBy(dx: 1.5, dy: 1.5)).fill()
+                        NSColor.systemGreen.setStroke()
+                        let lArcPath = NSBezierPath()
+                        lArcPath.lineWidth = 1.0
+                        lArcPath.appendArc(withCenter: lrhCenter, radius: handleR - 1,
+                                            startAngle: 30, endAngle: 300, clockwise: true)
+                        lArcPath.stroke()
+                    }
+                    // Rotation angle badge at midpoint
                     var angleDeg = atan2(item.y2 - item.y1, item.x2 - item.x1) * 180 / .pi
                     if angleDeg < 0 { angleDeg += 360 }
                     // Normalize to nearest display angle
@@ -649,12 +747,8 @@ class DocumentView: NSView, NSTextFieldDelegate {
                     bezel.stroke()
                 }
 
-                if hasRotation {
-                    NSGraphicsContext.restoreGraphicsState()
-                }
-
                 if item.isSelected {
-                    // Draw selection border without rotation (in screen space)
+                    // Draw selection border inside rotation transform so it rotates with the image
                     NSColor.controlAccentColor.withAlphaComponent(0.5).setStroke()
                     let border = NSBezierPath(rect: f.insetBy(dx: -1, dy: -1))
                     border.lineWidth = 1.5
@@ -669,6 +763,26 @@ class DocumentView: NSView, NSTextFieldDelegate {
                     NSBezierPath(ovalIn: ov).fill()
                     NSColor.white.setFill()
                     NSBezierPath(ovalIn: ov.insetBy(dx: 1.5, dy: 1.5)).fill()
+                    // Rotation handle (top-center, green)
+                    let rhCenter = NSPoint(x: f.midX, y: f.minY - rotHandleOffset)
+                    NSColor.systemGreen.withAlphaComponent(0.7).setStroke()
+                    let stemPath = NSBezierPath()
+                    stemPath.lineWidth = 1
+                    stemPath.move(to: NSPoint(x: f.midX, y: f.minY))
+                    stemPath.line(to: rhCenter)
+                    stemPath.stroke()
+                    let rhOv = NSRect(x: rhCenter.x - handleR, y: rhCenter.y - handleR,
+                                      width: handleR * 2, height: handleR * 2)
+                    NSColor.systemGreen.setFill()
+                    NSBezierPath(ovalIn: rhOv).fill()
+                    NSColor.white.setFill()
+                    NSBezierPath(ovalIn: rhOv.insetBy(dx: 1.5, dy: 1.5)).fill()
+                    NSColor.systemGreen.setStroke()
+                    let arcPath = NSBezierPath()
+                    arcPath.lineWidth = 1.0
+                    arcPath.appendArc(withCenter: rhCenter, radius: handleR - 1,
+                                       startAngle: 30, endAngle: 300, clockwise: true)
+                    arcPath.stroke()
                     // Rotation angle badge (only when rotated)
                     if hasRotation {
                         let displayAngle = abs(item.rotation) < 0.5 || abs(item.rotation - 360) < 0.5 ? 0 : item.rotation
@@ -681,7 +795,7 @@ class DocumentView: NSView, NSTextFieldDelegate {
                         let labelSz = label.size(withAttributes: badgeAttrs)
                         let badgePad: CGFloat = 3
                         let badgeRect = NSRect(x: f.midX - labelSz.width / 2 - badgePad,
-                                               y: f.minY - labelSz.height - badgePad - 4,
+                                               y: f.minY - labelSz.height - badgePad - 10 - rotHandleOffset,
                                                width: labelSz.width + badgePad * 2,
                                                height: labelSz.height + badgePad)
                         NSColor.controlAccentColor.withAlphaComponent(0.85).setFill()
@@ -690,6 +804,10 @@ class DocumentView: NSView, NSTextFieldDelegate {
                                                y: badgeRect.minY + badgePad / 2),
                                    withAttributes: badgeAttrs)
                     }
+                }
+
+                if hasRotation {
+                    NSGraphicsContext.restoreGraphicsState()
                 }
             }
 
@@ -700,8 +818,20 @@ class DocumentView: NSView, NSTextFieldDelegate {
                 let o = toScreen(NSPoint(x: item.x, y: item.y))
                 let drawRect = NSRect(x: o.x, y: o.y, width: sz.width * scale, height: sz.height * scale)
 
+                // Apply rotation transform around text center
+                let tcx = drawRect.midX, tcy = drawRect.midY
+                let hasTextRotation = abs(item.rotation) > 0.01
+                if hasTextRotation {
+                    NSGraphicsContext.saveGraphicsState()
+                    let rot = NSAffineTransform()
+                    rot.translateX(by: tcx, yBy: tcy)
+                    rot.rotate(byDegrees: -item.rotation)
+                    rot.translateX(by: -tcx, yBy: -tcy)
+                    rot.concat()
+                }
+
                 // Scale the font for screen rendering
-                let scaledFont = NSFont(name: "Helvetica", size: item.fontSize * scale)
+                let scaledFont = NSFont(name: item.fontName, size: item.fontSize * scale)
                     ?? NSFont.systemFont(ofSize: item.fontSize * scale)
                 let scaledAttrs: [NSAttributedString.Key: Any] = [
                     .font: scaledFont,
@@ -724,6 +854,30 @@ class DocumentView: NSView, NSTextFieldDelegate {
                     NSBezierPath(ovalIn: tov).fill()
                     NSColor.white.setFill()
                     NSBezierPath(ovalIn: tov.insetBy(dx: 1.5, dy: 1.5)).fill()
+                    // Rotation handle (top-center, green)
+                    let trhCenter = NSPoint(x: drawRect.midX, y: drawRect.minY - rotHandleOffset)
+                    NSColor.systemGreen.withAlphaComponent(0.7).setStroke()
+                    let tStemPath = NSBezierPath()
+                    tStemPath.lineWidth = 1
+                    tStemPath.move(to: NSPoint(x: drawRect.midX, y: drawRect.minY))
+                    tStemPath.line(to: trhCenter)
+                    tStemPath.stroke()
+                    let trhOv = NSRect(x: trhCenter.x - handleR, y: trhCenter.y - handleR,
+                                        width: handleR * 2, height: handleR * 2)
+                    NSColor.systemGreen.setFill()
+                    NSBezierPath(ovalIn: trhOv).fill()
+                    NSColor.white.setFill()
+                    NSBezierPath(ovalIn: trhOv.insetBy(dx: 1.5, dy: 1.5)).fill()
+                    NSColor.systemGreen.setStroke()
+                    let tArcPath = NSBezierPath()
+                    tArcPath.lineWidth = 1.0
+                    tArcPath.appendArc(withCenter: trhCenter, radius: handleR - 1,
+                                        startAngle: 30, endAngle: 300, clockwise: true)
+                    tArcPath.stroke()
+                }
+
+                if hasTextRotation {
+                    NSGraphicsContext.restoreGraphicsState()
                 }
             }
 
@@ -815,12 +969,32 @@ class DocumentView: NSView, NSTextFieldDelegate {
 
     private func isOnHandle(screen sp: NSPoint, item: ImageItem) -> Bool {
         let f = screenFrame(for: item)
-        return hypot(sp.x - f.maxX, sp.y - f.maxY) < handleR + 6
+        let handlePt = NSPoint(x: f.maxX, y: f.maxY)
+        if abs(item.rotation) > 0.01 {
+            let cx = f.midX, cy = f.midY
+            let t = NSAffineTransform()
+            t.translateX(by: cx, yBy: cy)
+            t.rotate(byDegrees: -item.rotation)
+            t.translateX(by: -cx, yBy: -cy)
+            let rh = t.transform(handlePt)
+            return hypot(sp.x - rh.x, sp.y - rh.y) < handleR + 6
+        }
+        return hypot(sp.x - handlePt.x, sp.y - handlePt.y) < handleR + 6
     }
 
     private func isOnTextHandle(screen sp: NSPoint, item: TextItem) -> Bool {
         let f = screenFrame(for: item)
-        return hypot(sp.x - f.maxX, sp.y - f.maxY) < handleR + 6
+        let handlePt = NSPoint(x: f.maxX, y: f.maxY)
+        if abs(item.rotation) > 0.01 {
+            let cx = f.midX, cy = f.midY
+            let t = NSAffineTransform()
+            t.translateX(by: cx, yBy: cy)
+            t.rotate(byDegrees: -item.rotation)
+            t.translateX(by: -cx, yBy: -cy)
+            let rh = t.transform(handlePt)
+            return hypot(sp.x - rh.x, sp.y - rh.y) < handleR + 6
+        }
+        return hypot(sp.x - handlePt.x, sp.y - handlePt.y) < handleR + 6
     }
 
     /// Returns 1 if near start endpoint, 2 if near end endpoint, 0 if neither.
@@ -830,6 +1004,50 @@ class DocumentView: NSView, NSTextFieldDelegate {
         if hypot(sp.x - p1.x, sp.y - p1.y) < handleR + 6 { return 1 }
         if hypot(sp.x - p2.x, sp.y - p2.y) < handleR + 6 { return 2 }
         return 0
+    }
+
+    private func isOnRotationHandle(screen sp: NSPoint, item: ImageItem) -> Bool {
+        let f = screenFrame(for: item)
+        let handlePt = NSPoint(x: f.midX, y: f.minY - rotHandleOffset)
+        if abs(item.rotation) > 0.01 {
+            let cx = f.midX, cy = f.midY
+            let t = NSAffineTransform()
+            t.translateX(by: cx, yBy: cy)
+            t.rotate(byDegrees: -item.rotation)
+            t.translateX(by: -cx, yBy: -cy)
+            let rh = t.transform(handlePt)
+            return hypot(sp.x - rh.x, sp.y - rh.y) < handleR + 6
+        }
+        return hypot(sp.x - handlePt.x, sp.y - handlePt.y) < handleR + 6
+    }
+
+    private func isOnTextRotationHandle(screen sp: NSPoint, item: TextItem) -> Bool {
+        let f = screenFrame(for: item)
+        let handlePt = NSPoint(x: f.midX, y: f.minY - rotHandleOffset)
+        if abs(item.rotation) > 0.01 {
+            let cx = f.midX, cy = f.midY
+            let t = NSAffineTransform()
+            t.translateX(by: cx, yBy: cy)
+            t.rotate(byDegrees: -item.rotation)
+            t.translateX(by: -cx, yBy: -cy)
+            let rh = t.transform(handlePt)
+            return hypot(sp.x - rh.x, sp.y - rh.y) < handleR + 6
+        }
+        return hypot(sp.x - handlePt.x, sp.y - handlePt.y) < handleR + 6
+    }
+
+    private func isOnLineRotationHandle(screen sp: NSPoint, item: LineItem) -> Bool {
+        let p1 = toScreen(NSPoint(x: item.x1, y: item.y1))
+        let p2 = toScreen(NSPoint(x: item.x2, y: item.y2))
+        let mid = NSPoint(x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2)
+        let ldx = p2.x - p1.x, ldy = p2.y - p1.y
+        let len = hypot(ldx, ldy)
+        guard len > 1 else { return false }
+        let perpX = -ldy / len, perpY = ldx / len
+        let sign: CGFloat = perpY < 0 ? 1.0 : -1.0
+        let handlePt = NSPoint(x: mid.x + sign * perpX * rotHandleOffset,
+                               y: mid.y + sign * perpY * rotHandleOffset)
+        return hypot(sp.x - handlePt.x, sp.y - handlePt.y) < handleR + 6
     }
 
     // ── Mouse events ──
@@ -851,7 +1069,8 @@ class DocumentView: NSView, NSTextFieldDelegate {
         switch mode {
         case .addText:
             pushUndo()
-            let item = TextItem(text: "Text", x: a4.x, y: a4.y)
+            let item = TextItem(text: "Text", x: a4.x, y: a4.y,
+                                  fontSize: defaultFontSize, color: defaultTextColor)
             texts.append(item)
             selectText(item)
             markDirty()
@@ -871,8 +1090,37 @@ class DocumentView: NSView, NSTextFieldDelegate {
             break
         }
 
-        // Select mode: check resize handle, then hit test
-        if let item = selectedImage, isOnHandle(screen: sp, item: item) {
+        // Select mode: check rotation handle, then resize handle, then hit test
+        if let item = selectedImage, isOnRotationHandle(screen: sp, item: item) {
+            pushUndo()
+            isRotatingWithMouse = true
+            let f = screenFrame(for: item)
+            mouseRotationStartAngle = atan2(sp.y - f.midY, sp.x - f.midX)
+            mouseRotationItemStartRotation = item.rotation
+            rotationSnappedTo = -1
+            dragStartScreen = sp
+        } else if let item = selectedText, isOnTextRotationHandle(screen: sp, item: item) {
+            pushUndo()
+            isRotatingWithMouse = true
+            let f = screenFrame(for: item)
+            mouseRotationStartAngle = atan2(sp.y - f.midY, sp.x - f.midX)
+            mouseRotationItemStartRotation = item.rotation
+            rotationSnappedTo = -1
+            dragStartScreen = sp
+        } else if let item = selectedLine, isOnLineRotationHandle(screen: sp, item: item) {
+            pushUndo()
+            isRotatingWithMouse = true
+            mouseRotLineStart = NSPoint(x: item.x1, y: item.y1)
+            mouseRotLineEnd = NSPoint(x: item.x2, y: item.y2)
+            gestureLineStart = mouseRotLineStart
+            gestureLineEnd = mouseRotLineEnd
+            let p1s = toScreen(NSPoint(x: item.x1, y: item.y1))
+            let p2s = toScreen(NSPoint(x: item.x2, y: item.y2))
+            let midS = NSPoint(x: (p1s.x + p2s.x) / 2, y: (p1s.y + p2s.y) / 2)
+            mouseRotationStartAngle = atan2(sp.y - midS.y, sp.x - midS.x)
+            lineRotationSnappedTo = -1
+            dragStartScreen = sp
+        } else if let item = selectedImage, isOnHandle(screen: sp, item: item) {
             pushUndo()
             isResizing = true
             dragStartScreen = sp
@@ -1003,6 +1251,45 @@ class DocumentView: NSView, NSTextFieldDelegate {
             return
         }
 
+        if isRotatingWithMouse {
+            if let item = selectedImage {
+                let f = screenFrame(for: item)
+                let currentAngle = atan2(sp.y - f.midY, sp.x - f.midX)
+                let deltaAngle = -(currentAngle - mouseRotationStartAngle) * 180 / .pi
+                item.rotation = applyRotationSnap(rawDegrees: mouseRotationItemStartRotation + deltaAngle)
+                markDirty(); needsDisplay = true
+            } else if let item = selectedText {
+                let f = screenFrame(for: item)
+                let currentAngle = atan2(sp.y - f.midY, sp.x - f.midX)
+                let deltaAngle = -(currentAngle - mouseRotationStartAngle) * 180 / .pi
+                item.rotation = applyRotationSnap(rawDegrees: mouseRotationItemStartRotation + deltaAngle)
+                markDirty(); needsDisplay = true
+            } else if let item = selectedLine {
+                let midX = (mouseRotLineStart.x + mouseRotLineEnd.x) / 2
+                let midY = (mouseRotLineStart.y + mouseRotLineEnd.y) / 2
+                let midScreen = toScreen(NSPoint(x: midX, y: midY))
+                let currentAngle = atan2(sp.y - midScreen.y, sp.x - midScreen.x)
+                let deltaAngleRad = -(currentAngle - mouseRotationStartAngle)
+                let cosA = cos(deltaAngleRad), sinA = sin(deltaAngleRad)
+                let dx1 = mouseRotLineStart.x - midX, dy1 = mouseRotLineStart.y - midY
+                let dx2 = mouseRotLineEnd.x - midX, dy2 = mouseRotLineEnd.y - midY
+                let newX1 = midX + dx1 * cosA - dy1 * sinA
+                let newY1 = midY + dx1 * sinA + dy1 * cosA
+                let newX2 = midX + dx2 * cosA - dy2 * sinA
+                let newY2 = midY + dx2 * sinA + dy2 * cosA
+                var lineAngle = atan2(newY2 - newY1, newX2 - newX1) * 180 / .pi
+                if lineAngle < 0 { lineAngle += 360 }
+                if let snapDeg = applyLineRotationSnap(lineAngleDeg: lineAngle) {
+                    applyLineSnap(line: item, snapDeg: snapDeg, midX: midX, midY: midY)
+                } else {
+                    item.x1 = newX1; item.y1 = newY1
+                    item.x2 = newX2; item.y2 = newY2
+                }
+                markDirty(); needsDisplay = true
+            }
+            return
+        }
+
         if isDraggingLineEndpoint, let item = selectedLine {
             let a4 = toA4(sp)
             if draggingEndpoint == 1 { item.x1 = a4.x; item.y1 = a4.y }
@@ -1064,6 +1351,9 @@ class DocumentView: NSView, NSTextFieldDelegate {
             } else if let item = selectedText {
                 item.x = itemStartPos.x + dx
                 item.y = itemStartPos.y + dy
+                let (sdx, sdy, guides) = computeTextSnaps(for: item)
+                item.x += sdx; item.y += sdy
+                activeGuides = guides
                 markDirty()
             } else if let item = selectedLine {
                 item.x1 = itemStartPos.x + dx
@@ -1117,6 +1407,7 @@ class DocumentView: NSView, NSTextFieldDelegate {
         isResizing = false
         isResizingText = false
         isDraggingLineEndpoint = false
+        isRotatingWithMouse = false
         activeGuides = []
         NSCursor.arrow.set()
         needsDisplay = true
@@ -1169,20 +1460,78 @@ class DocumentView: NSView, NSTextFieldDelegate {
     private let rotationSnapThreshold: CGFloat = 3   // degrees to enter snap
     private let rotationEscapeThreshold: CGFloat = 8 // degrees to break free
 
+    /// Apply rotation snap detent logic. Returns the snapped rotation value in degrees.
+    private func applyRotationSnap(rawDegrees: CGFloat) -> CGFloat {
+        var raw = rawDegrees.truncatingRemainder(dividingBy: 360)
+        if raw < 0 { raw += 360 }
+        let snapAngles: [CGFloat] = [0, 90, 180, 270, 360]
+        if rotationSnappedTo >= 0 {
+            let distFromSnap = min(abs(raw - rotationSnappedTo),
+                                    abs(raw - rotationSnappedTo + 360),
+                                    abs(raw - rotationSnappedTo - 360))
+            if distFromSnap < rotationEscapeThreshold {
+                return rotationSnappedTo == 360 ? 0 : rotationSnappedTo
+            }
+            rotationSnappedTo = -1
+        }
+        for sa in snapAngles {
+            let dist = min(abs(raw - sa), abs(raw - sa + 360), abs(raw - sa - 360))
+            if dist < rotationSnapThreshold {
+                if rotationSnappedTo != sa {
+                    hapticPerformer.perform(.alignment, performanceTime: .now)
+                    rotationSnappedTo = sa
+                }
+                return sa == 360 ? 0 : sa
+            }
+        }
+        return raw
+    }
+
+    /// Apply line rotation snap. Returns the snapped line angle in degrees, or nil for free rotation.
+    private func applyLineRotationSnap(lineAngleDeg: CGFloat) -> CGFloat? {
+        let snapAngles: [CGFloat] = [0, 90, 180, 270, 360]
+        if lineRotationSnappedTo >= 0 {
+            let distFromSnap = min(abs(lineAngleDeg - lineRotationSnappedTo),
+                                    abs(lineAngleDeg - lineRotationSnappedTo + 360),
+                                    abs(lineAngleDeg - lineRotationSnappedTo - 360))
+            if distFromSnap < rotationEscapeThreshold {
+                return lineRotationSnappedTo
+            }
+            lineRotationSnappedTo = -1
+        }
+        for sa in snapAngles {
+            let dist = min(abs(lineAngleDeg - sa), abs(lineAngleDeg - sa + 360), abs(lineAngleDeg - sa - 360))
+            if dist < rotationSnapThreshold {
+                if lineRotationSnappedTo != sa {
+                    hapticPerformer.perform(.alignment, performanceTime: .now)
+                    lineRotationSnappedTo = sa
+                }
+                return sa
+            }
+        }
+        return nil
+    }
+
     @objc func handleRotate(_ gesture: NSRotationGestureRecognizer) {
-        // Rotate images or lines
+        if gesture.state == .began { isRotatingWithMouse = false }
+        // Rotate images, text, or lines
         if let line = selectedLine {
             handleRotateLine(gesture, line: line)
             return
         }
-        guard let item = selectedImage else { return }
+        // Get current rotation from either image or text
+        let currentRotation: CGFloat
+        if let img = selectedImage { currentRotation = img.rotation }
+        else if let txt = selectedText { currentRotation = txt.rotation }
+        else { return }
+
         if gesture.state == .began {
             pushUndo()
-            gestureStartRotation = item.rotation
+            gestureStartRotation = currentRotation
             rotationSnappedTo = -1
         } else if gesture.state == .changed {
             let degrees = gesture.rotation * 180 / .pi
-            var raw = gestureStartRotation - CGFloat(degrees)
+            var raw = gestureStartRotation + CGFloat(degrees)
             raw = raw.truncatingRemainder(dividingBy: 360)
             if raw < 0 { raw += 360 }
 
@@ -1190,25 +1539,19 @@ class DocumentView: NSView, NSTextFieldDelegate {
             let snapAngles: [CGFloat] = [0, 90, 180, 270, 360]
 
             if rotationSnappedTo >= 0 {
-                // Currently snapped — hold until escape threshold
-                var minDist: CGFloat = .greatestFiniteMagnitude
-                for sa in snapAngles {
-                    minDist = min(minDist, min(abs(raw - sa), abs(raw - sa + 360), abs(raw - sa - 360)))
-                }
                 let distFromSnap = min(abs(raw - rotationSnappedTo),
                                         abs(raw - rotationSnappedTo + 360),
                                         abs(raw - rotationSnappedTo - 360))
                 if distFromSnap < rotationEscapeThreshold {
-                    // Stay locked
-                    item.rotation = rotationSnappedTo == 360 ? 0 : rotationSnappedTo
+                    let snappedVal = rotationSnappedTo == 360 ? 0 : rotationSnappedTo
+                    if let img = selectedImage { img.rotation = snappedVal }
+                    else if let txt = selectedText { txt.rotation = snappedVal }
                     markDirty(); needsDisplay = true
                     return
                 }
-                // Escaped
                 rotationSnappedTo = -1
             }
 
-            // Check if we should snap
             for sa in snapAngles {
                 let dist = min(abs(raw - sa), abs(raw - sa + 360), abs(raw - sa - 360))
                 if dist < rotationSnapThreshold {
@@ -1216,13 +1559,16 @@ class DocumentView: NSView, NSTextFieldDelegate {
                         hapticPerformer.perform(.alignment, performanceTime: .now)
                         rotationSnappedTo = sa
                     }
-                    item.rotation = sa == 360 ? 0 : sa
+                    let snappedVal = sa == 360 ? 0 : sa
+                    if let img = selectedImage { img.rotation = snappedVal }
+                    else if let txt = selectedText { txt.rotation = snappedVal }
                     markDirty(); needsDisplay = true
                     return
                 }
             }
 
-            item.rotation = raw
+            if let img = selectedImage { img.rotation = raw }
+            else if let txt = selectedText { txt.rotation = raw }
             markDirty(); needsDisplay = true
         }
     }
@@ -1348,7 +1694,7 @@ class DocumentView: NSView, NSTextFieldDelegate {
                                               width: max(100, sz.width * scale + 20),
                                               height: max(24, sz.height * scale + 4)))
         field.stringValue = item.text
-        field.font = NSFont(name: "Helvetica", size: item.fontSize * scale)
+        field.font = NSFont(name: item.fontName, size: item.fontSize * scale)
             ?? NSFont.systemFont(ofSize: item.fontSize * scale)
         field.textColor = item.color
         field.isBordered = true
@@ -1364,6 +1710,15 @@ class DocumentView: NSView, NSTextFieldDelegate {
 
     @objc func textFieldAction(_ sender: NSTextField) {
         commitTextEditing()
+    }
+
+    func controlTextDidChange(_ obj: Notification) {
+        guard let field = editingTextField, let item = editingTextItem else { return }
+        let font = NSFont(name: item.fontName, size: item.fontSize * scale)
+            ?? NSFont.systemFont(ofSize: item.fontSize * scale)
+        let textSize = (field.stringValue as NSString).size(withAttributes: [.font: font])
+        field.frame.size.width = max(100, textSize.width + 20)
+        field.frame.size.height = max(24, textSize.height + 4)
     }
 
     func controlTextDidEndEditing(_ obj: Notification) {
@@ -1542,6 +1897,11 @@ class DocumentView: NSView, NSTextFieldDelegate {
             pushUndo()
             item.rotate(by: degrees)
             markDirty(); needsDisplay = true
+        } else if let item = selectedText {
+            pushUndo()
+            item.rotation = (item.rotation + degrees).truncatingRemainder(dividingBy: 360)
+            if item.rotation < 0 { item.rotation += 360 }
+            markDirty(); needsDisplay = true
         } else if let item = selectedLine {
             // Rotate line around its midpoint
             pushUndo()
@@ -1607,6 +1967,14 @@ class DocumentView: NSView, NSTextFieldDelegate {
         guard newSize != pageSize else { return }
         pushUndo()
         pageSize = newSize
+        markDirty()
+        onRelayout?()
+        needsDisplay = true
+    }
+
+    func toggleOrientation() {
+        pushUndo()
+        isLandscape.toggle()
         markDirty()
         onRelayout?()
         needsDisplay = true
@@ -1703,8 +2071,21 @@ class DocumentView: NSView, NSTextFieldDelegate {
             for item in texts {
                 let sz = item.size
                 guard item.y + sz.height > top && item.y < top + PH else { continue }
-                (item.text as NSString).draw(at: NSPoint(x: item.x, y: item.y - top),
-                                              withAttributes: item.attrs)
+                let textPt = NSPoint(x: item.x, y: item.y - top)
+                let hasTextRotation = abs(item.rotation) > 0.01
+                if hasTextRotation {
+                    NSGraphicsContext.saveGraphicsState()
+                    let tcx = textPt.x + sz.width / 2, tcy = textPt.y + sz.height / 2
+                    let rot = NSAffineTransform()
+                    rot.translateX(by: tcx, yBy: tcy)
+                    rot.rotate(byDegrees: -item.rotation)
+                    rot.translateX(by: -tcx, yBy: -tcy)
+                    rot.concat()
+                }
+                (item.text as NSString).draw(at: textPt, withAttributes: item.attrs)
+                if hasTextRotation {
+                    NSGraphicsContext.restoreGraphicsState()
+                }
             }
 
             NSGraphicsContext.restoreGraphicsState()
@@ -1736,6 +2117,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var gridBtn: NSButton!
     var textModeBtn: NSButton!
     var lineModeBtn: NSButton!
+    var textColorPopup: NSPopUpButton!
+    var fontSizePopup: NSPopUpButton!
+    var boldBtn: NSButton!
+    var italicBtn: NSButton!
+
+    var defaultTextColor: NSColor = .black
+    var defaultFontSize: CGFloat = 16
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         doc = DocumentView(frame: .zero)
@@ -1782,7 +2170,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 700, height: 880),
                           styleMask: [.titled, .closable, .resizable, .miniaturizable],
                           backing: .buffered, defer: false)
-        window.title = "A4 Layout"
+        window.title = "PDF Layout"
         window.contentView = stack
         window.minSize = NSSize(width: 620, height: 500)
         window.center()
@@ -1818,6 +2206,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // ── Page size & background ──
         pageSizePopup = makePopup(["A4", "Letter"], action: #selector(pageSizeChanged(_:)))
         stack.addArrangedSubview(pageSizePopup)
+
+        let orientBtn = makeIconBtn("rectangle.landscape.rotate",
+                                     tip: "Toggle landscape/portrait (⌘L)",
+                                     action: #selector(toggleOrientation))
+        stack.addArrangedSubview(orientBtn)
 
         bgPopup = makePopup(["White", "Gray", "Cream", "Black"],
                              action: #selector(bgColorChanged(_:)))
@@ -1874,6 +2267,28 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         opacityLabel.textColor = .secondaryLabelColor
         opacityLabel.widthAnchor.constraint(equalToConstant: 30).isActive = true
         stack.addArrangedSubview(opacityLabel)
+
+        stack.addArrangedSubview(makeDivider())
+
+        // ── Text controls ──
+        textColorPopup = makePopup(["Black", "Red", "Blue", "Gray", "White"],
+                                    action: #selector(textColorChanged(_:)))
+        textColorPopup.toolTip = "Text color"
+        stack.addArrangedSubview(textColorPopup)
+
+        fontSizePopup = makePopup(["10", "12", "14", "16", "20", "24", "32", "48", "72"],
+                                   action: #selector(fontSizeChanged(_:)))
+        fontSizePopup.selectItem(at: 3)  // default 16
+        fontSizePopup.toolTip = "Font size"
+        stack.addArrangedSubview(fontSizePopup)
+
+        boldBtn = makeIconBtn("bold", tip: "Bold", action: #selector(toggleBold))
+        boldBtn.setButtonType(.pushOnPushOff)
+        stack.addArrangedSubview(boldBtn)
+
+        italicBtn = makeIconBtn("italic", tip: "Italic", action: #selector(toggleItalic))
+        italicBtn.setButtonType(.pushOnPushOff)
+        stack.addArrangedSubview(italicBtn)
 
         stack.addArrangedSubview(makeDivider())
 
@@ -1957,9 +2372,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func updateToolbarForSelection() {
         let hasImg = doc.selectedImage != nil
         let hasLine = doc.selectedLine != nil
+        let hasTxt = doc.selectedText != nil
         framePopup.isEnabled = hasImg || hasLine
         frameWidthPopup.isEnabled = hasImg || hasLine
         opacitySlider.isEnabled = hasImg
+        textColorPopup.isEnabled = hasTxt
+        fontSizePopup.isEnabled = hasTxt
+        boldBtn.isEnabled = hasTxt
+        italicBtn.isEnabled = hasTxt
 
         // Highlight active mode
         textModeBtn.state = doc.mode == .addText ? .on : .off
@@ -1981,7 +2401,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             else if item.frameWidth <= 1 { frameWidthPopup.selectItem(at: 1) }
             else { frameWidthPopup.selectItem(at: 2) }
         } else if let item = doc.selectedLine {
-            // Show line properties in color/width popups
             let c = item.color
             if c == .black { framePopup.selectItem(at: 1) }
             else if c == NSColor.darkGray { framePopup.selectItem(at: 2) }
@@ -1996,6 +2415,25 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         } else {
             opacitySlider.doubleValue = 1.0
             opacityLabel.stringValue = "100%"
+        }
+
+        if let item = doc.selectedText {
+            // Sync text toolbar to selected item
+            let tc = item.color
+            if tc == .black { textColorPopup.selectItem(at: 0) }
+            else if tc == .red { textColorPopup.selectItem(at: 1) }
+            else if tc == .blue { textColorPopup.selectItem(at: 2) }
+            else if tc == NSColor.darkGray { textColorPopup.selectItem(at: 3) }
+            else if tc == .white { textColorPopup.selectItem(at: 4) }
+            let sizes: [CGFloat] = [10, 12, 14, 16, 20, 24, 32, 48, 72]
+            if let idx = sizes.firstIndex(where: { abs($0 - item.fontSize) < 0.5 }) {
+                fontSizePopup.selectItem(at: idx)
+            }
+            boldBtn.state = item.isBold ? .on : .off
+            italicBtn.state = item.isItalic ? .on : .off
+        } else {
+            boldBtn.state = .off
+            italicBtn.state = .off
         }
     }
 
@@ -2046,6 +2484,40 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         updateToolbarForSelection()
     }
 
+    @objc func textColorChanged(_ sender: NSPopUpButton) {
+        let colors: [NSColor] = [.black, .red, .blue, .darkGray, .white]
+        let color = colors[sender.indexOfSelectedItem]
+        defaultTextColor = color
+        doc.defaultTextColor = color
+        if let item = doc.selectedText {
+            doc.pushUndo(); item.color = color; doc.markDirty(); doc.needsDisplay = true
+        }
+    }
+
+    @objc func fontSizeChanged(_ sender: NSPopUpButton) {
+        let sizes: [CGFloat] = [10, 12, 14, 16, 20, 24, 32, 48, 72]
+        let sz = sizes[sender.indexOfSelectedItem]
+        defaultFontSize = sz
+        doc.defaultFontSize = sz
+        if let item = doc.selectedText {
+            doc.pushUndo(); item.fontSize = sz; doc.markDirty(); doc.needsDisplay = true
+        }
+    }
+
+    @objc func toggleBold() {
+        if let item = doc.selectedText {
+            doc.pushUndo(); item.isBold.toggle(); doc.markDirty(); doc.needsDisplay = true
+            boldBtn.state = item.isBold ? .on : .off
+        }
+    }
+
+    @objc func toggleItalic() {
+        if let item = doc.selectedText {
+            doc.pushUndo(); item.isItalic.toggle(); doc.markDirty(); doc.needsDisplay = true
+            italicBtn.state = item.isItalic ? .on : .off
+        }
+    }
+
     // ── Layout ──
 
     @objc func relayout() {
@@ -2062,9 +2534,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         // App menu
         let appMenu = NSMenu()
-        appMenu.addItem(withTitle: "About A4 Layout", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+        appMenu.addItem(withTitle: "About PDF Layout", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
         appMenu.addItem(NSMenuItem.separator())
-        appMenu.addItem(withTitle: "Quit A4 Layout", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        appMenu.addItem(withTitle: "Quit PDF Layout", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         let appItem = NSMenuItem(); appItem.submenu = appMenu
         mainMenu.addItem(appItem)
 
@@ -2079,6 +2551,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let rmPg = NSMenuItem(title: "Remove Last Page", action: #selector(removePage), keyEquivalent: "n")
         rmPg.target = self; rmPg.keyEquivalentModifierMask = [.command, .shift]
         fileMenu.addItem(rmPg)
+        fileMenu.addItem(NSMenuItem.separator())
+        let orient = NSMenuItem(title: "Toggle Landscape", action: #selector(toggleOrientation), keyEquivalent: "l")
+        orient.target = self; fileMenu.addItem(orient)
         let fileItem = NSMenuItem(); fileItem.submenu = fileMenu
         mainMenu.addItem(fileItem)
 
@@ -2134,6 +2609,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     @objc func removePage() { doc.removePage(); relayout() }
+    @objc func toggleOrientation() { doc.toggleOrientation(); relayout() }
 
     // ── Window delegate (unsaved changes) ──
 

@@ -1,4 +1,4 @@
-# A4 Layout
+# PDF Layout
 
 A minimal native macOS app for arranging images, text, and lines on pages and exporting as PDF.
 
@@ -7,7 +7,7 @@ A minimal native macOS app for arranging images, text, and lines on pages and ex
 ## Features
 
 - **Compact toolbar** with all tools visible — no memorizing shortcuts
-- **A4 and US Letter** page sizes
+- **A4 and US Letter** page sizes with **portrait / landscape** toggle
 - **Paste images** (⌘V) or **drag & drop** from Finder
 - **Smart snap guides** — images and lines snap to edges, centers, and page boundaries
 - **Center-based resize** — images scale symmetrically from their center
@@ -41,7 +41,7 @@ cd a4layout
 ./build.sh
 ```
 
-This creates **A4 Layout.app** in the current directory. Move it to `/Applications` or double-click to run.
+This creates **PDF Layout.app** in the current directory. Move it to `/Applications` or double-click to run.
 
 ## Keyboard Shortcuts
 
@@ -51,6 +51,7 @@ This creates **A4 Layout.app** in the current directory. Move it to `/Applicatio
 | ⌘D | Duplicate selected element |
 | ⌘B | Toggle frame on selected image |
 | ⌘R | Rotate selected image or line 90° |
+| ⌘L | Toggle landscape / portrait |
 | ⌘G | Toggle grid overlay |
 | ⌘] | Bring to front |
 | ⌘[ | Send to back |
@@ -73,4 +74,4 @@ This creates **A4 Layout.app** in the current directory. Move it to `/Applicatio
 
 ## How It Works
 
-One Swift file (`a4layout.swift`), no Xcode project, no dependencies. Uses AppKit for the UI and CoreGraphics for PDF export. All elements are stored in page coordinate space (595×842pt for A4, 612×792pt for Letter) and scaled to the screen for resolution-independent layout.
+One Swift file (`pdflayout.swift`), no Xcode project, no dependencies. Uses AppKit for the UI and CoreGraphics for PDF export. All elements are stored in page coordinate space (595×842pt for A4, 612×792pt for Letter) and scaled to the screen for resolution-independent layout.
